@@ -14,6 +14,9 @@ importers:
       '@google/genai':
         specifier: ^2.19.0
         version: 2.19.0(@modelcontextprotocol/sdk@1.30.0(zod@4.4.3))
+      '@jitsi/rnnoise-wasm':
+        specifier: 0.2.1
+        version: 0.2.1
       '@modelcontextprotocol/sdk':
         specifier: ^1.30.0
         version: 1.30.0(zod@4.4.3)
@@ -410,6 +413,9 @@ packages:
     engines: {node: ^18.17.0 || ^20.3.0 || >=21.0.0}
     cpu: [x64]
     os: [win32]
+
+  '@jitsi/rnnoise-wasm@0.2.1':
+    resolution: {integrity: sha512-iEj77www43pS2Yq+cfLZb+hFuI7L5ccisBzzPMcOjjLsG4/LAlkD1CY58/8gc84nHdLBGmD/OPIWGnvYnXvB0A==}
 
   '@jridgewell/sourcemap-codec@1.5.5':
     resolution: {integrity: sha512-cYQ9310grqxueWbl+WuIUIaiUaDcj7WOq5fVhEljNVgRfOUhY9fy2zTvfoqWsnebh8Sl70VScFbICvJnLKB0Og==}
@@ -2261,6 +2267,8 @@ snapshots:
 
   '@img/sharp-win32-x64@0.34.5':
     optional: true
+
+  '@jitsi/rnnoise-wasm@0.2.1': {}
 
   '@jridgewell/sourcemap-codec@1.5.5': {}
 

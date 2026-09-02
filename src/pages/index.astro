@@ -82,6 +82,12 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
         </label>
 
         <label class="field">
+          <span class="field-label">Noise reduction</span>
+          <select class="field-input" data-field="noiseReduction"></select>
+          <span class="field-hint">AI removes keyboard/background noise before speech detection. Applies to your next call.</span>
+        </label>
+
+        <label class="field">
           <span class="field-label">Voice detection</span>
           <select class="field-input" data-field="vadMode"></select>
           <span class="field-hint">Server = Gemini detects your speech (simple). Browser = local Silero VAD signals it explicitly — fastest, downloads ~16 MB once. Applies to your next call.</span>
@@ -131,8 +137,13 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       systemInstruction: '',
       responsiveness: 'balanced', // snappy | balanced | relaxed — end-of-speech window
       vadMode: 'server',          // 'server' (automatic detection) | 'browser' (local Silero VAD)
+      noiseReduction: 'ai',       // 'ai' (RNNoise + browser filters) | 'browser' (filters only)
       mcpServers: [],
     };
+    const NOISE_OPTS = [
+      { value: 'ai', label: 'AI + browser (recommended)' },
+      { value: 'browser', label: 'Browser only' },
+    ];
     const RESPONSIVENESS_OPTS = [
       { value: 'snappy', label: 'Snappy · 350ms' },
       { value: 'balanced', label: 'Balanced · 600ms' },
@@ -174,6 +185,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       modelField: $('[data-role="model-field"]'),
       fVoice: $('[data-field="voice"]'),
       fVadMode: $('[data-field="vadMode"]'),
+      fNoise: $('[data-field="noiseReduction"]'),
       fResponsiveness: $('[data-field="responsiveness"]'),
       fSystem: $('[data-field="systemInstruction"]'),
       mcpList: $('[data-role="mcp-list"]'),
@@ -240,7 +252,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       }
     }
 
-    const VAD_BADGE_LABEL = { silero: 'Silero VAD', energy: 'Energy VAD', server: 'Server VAD' };
+    const VAD_BADGE_LABEL = { silero: 'Silero VAD', energy: 'Energy VAD', rnnoise: 'RNNoise VAD', server: 'Server VAD' };
     /** Reflect the engine ACTUALLY in use this call (post-fallback), not the
      * Settings choice. `null` hides the badge (no call running). */
     function setVadBadge(kind) {
@@ -431,6 +443,8 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     let serverBarge = false;                // server-VAD mode: user broke through the gate
     let serverBargeRun = 0;
     let energyGuard = null;                 // energy detector for server-mode echo guard
+    let micNp = -1;                         // RNNoise speech prob of recent mic frames (-1 = no denoiser)
+    let rnnoiseBadgeShown = false;
 
     // wasm SIMD feature probe (ort 1.29 ships ONLY the SIMD build and hard-throws
     // without it — the known Android-WebView failure). Standard detect bytes.
@@ -447,6 +461,14 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
         kind: 'energy',
         resetState() { floor = 0.01; },
         async prob(window512) {
+          // When the RNNoise denoiser is running, its trained per-frame speech
+          // probability beats any RMS heuristic — use it directly. (This is
+          // the fix for noise slipping past the old threshold.)
+          if (micNp >= 0) {
+            if (micNp >= 0.6) return 0.9;
+            if (micNp >= 0.3) return 0.6;
+            return 0.1;
+          }
           let sum = 0;
           for (let i = 0; i < window512.length; i++) sum += window512[i] * window512[i];
           const rms = Math.sqrt(sum / window512.length);
@@ -515,6 +537,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       vadSpeaking = false; vadStartRun = 0; vadSilenceMs = 0;
       vadAccum = new Float32Array(0); preRoll.length = 0;
       serverBarge = false; serverBargeRun = 0; modelSpeaking = false;
+      micNp = -1; rnnoiseBadgeShown = false;
       vadEngine?.resetState();
       energyGuard?.resetState();
     }
@@ -540,7 +563,11 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
         // (louder, sustained) still does.
         const startProb = modelSpeaking ? VAD_BARGE_PROB : VAD_START_PROB;
         const startWindows = modelSpeaking ? VAD_BARGE_WINDOWS : VAD_START_WINDOWS;
-        vadStartRun = prob >= startProb ? vadStartRun + 1 : 0;
+        // Denoiser cross-check on speech-START only: if RNNoise says the recent
+        // audio is clean silence, a click/hum can't accumulate a start run.
+        // End-of-speech logic is untouched so the user is never clipped.
+        const npVeto = micNp >= 0 && micNp < 0.05;
+        vadStartRun = (prob >= startProb && !npVeto) ? vadStartRun + 1 : 0;
         if (vadStartRun >= startWindows) {
           vadSpeaking = true; vadSilenceMs = 0;
           // Instant local barge-in: fade Gemini out the moment the user speaks
@@ -593,8 +620,15 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       }
     }
 
-    function onMicFrame(buf) {
+    function onMicFrame(buf, np = -1) {
       if (muted) { userLevel = 0; return; }
+      micNp = np;
+      // Badge honesty: if the fallback energy tier is being driven by RNNoise
+      // probs, say so (once, when the first denoised frame proves it's live).
+      if (np >= 0 && vadEngineKind === 'energy' && !rnnoiseBadgeShown) {
+        rnnoiseBadgeShown = true;
+        setVadBadge('rnnoise');
+      }
 
       // Cheap strided RMS for the button glow (every 4th sample of 20 ms).
       {
@@ -630,15 +664,53 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
         audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       });
       captureCtx = new AudioContext();
-      await captureCtx.audioWorklet.addModule('worklets/capture-worklet.js');
+
+      // Noise reduction 'ai' loads the RNNoise variant of the capture worklet
+      // (a separate module so calls without it never download the ~2 MB wasm).
+      // Any load failure falls back to the plain worklet — never break capture.
+      let processorName = 'capture-worklet';
+      if ((config.noiseReduction ?? DEFAULTS.noiseReduction) === 'ai') {
+        try {
+          await captureCtx.audioWorklet.addModule('worklets/capture-denoise-worklet.js');
+          processorName = 'capture-worklet-denoise';
+        } catch (err) {
+          console.error('[callgemini] denoise worklet failed to load, using plain capture:', err);
+          systemLine('AI noise reduction unavailable — using browser filters only.', 'info');
+        }
+      }
+      if (processorName === 'capture-worklet') {
+        await captureCtx.audioWorklet.addModule('worklets/capture-worklet.js');
+      }
+
       const source = captureCtx.createMediaStreamSource(captureStream);
-      const node = new AudioWorkletNode(captureCtx, 'capture-worklet');
-      node.port.onmessage = (e) => onMicFrame(e.data);
+      // Classical gain staging BEFORE any AI: an 80 Hz highpass kills rumble /
+      // handling noise, and a compressor catches spikes so nothing clips —
+      // RNNoise (and the VADs) want a stable, unclipped signal. Native nodes,
+      // zero CPU cost worth mentioning.
+      const highpass = captureCtx.createBiquadFilter();
+      highpass.type = 'highpass';
+      highpass.frequency.value = 80;
+      const compressor = captureCtx.createDynamicsCompressor();
+      compressor.threshold.value = -24;
+      compressor.knee.value = 30;
+      compressor.ratio.value = 12;
+      compressor.attack.value = 0.003;
+      compressor.release.value = 0.25;
+
+      const node = new AudioWorkletNode(captureCtx, processorName);
+      node.port.onmessage = (e) => {
+        const d = e.data;
+        if (d && d.buf) { onMicFrame(d.buf, d.np); return; }
+        if (d && d.denoiseError) {
+          console.error('[callgemini] RNNoise init failed:', d.denoiseError);
+          systemLine(`AI noise reduction failed (${d.denoiseError}) — continuing without it.`, 'info');
+        }
+      };
       // A worklet is only pulled if it feeds a sink — route through a muted gain
       // so the mic never echoes to the speakers.
       const sink = captureCtx.createGain();
       sink.gain.value = 0;
-      source.connect(node).connect(sink).connect(captureCtx.destination);
+      source.connect(highpass).connect(compressor).connect(node).connect(sink).connect(captureCtx.destination);
     }
 
     /** Android WebView (Capacitor et al.): UA carries "; wv)" on modern builds
@@ -907,6 +979,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       syncModelCustomVisibility();
       fillSelect(els.fVoice, VOICES.map((v) => ({ value: v, label: v })), config.voiceName ?? DEFAULTS.voiceName);
       fillSelect(els.fVadMode, VAD_MODE_OPTS, config.vadMode ?? DEFAULTS.vadMode);
+      fillSelect(els.fNoise, NOISE_OPTS, config.noiseReduction ?? DEFAULTS.noiseReduction);
       fillSelect(els.fResponsiveness, RESPONSIVENESS_OPTS, config.responsiveness ?? DEFAULTS.responsiveness);
       renderMcpRows();
       els.modal.dataset.open = 'true';
@@ -924,6 +997,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
         model: (preset === 'custom' ? els.fModel.value.trim() : preset) || DEFAULTS.model,
         voiceName: els.fVoice.value || DEFAULTS.voiceName,
         vadMode: els.fVadMode.value || DEFAULTS.vadMode,
+        noiseReduction: els.fNoise.value || DEFAULTS.noiseReduction,
         responsiveness: els.fResponsiveness.value || DEFAULTS.responsiveness,
         systemInstruction: els.fSystem.value.trim(),
         mcpServers: readMcpRows(),
@@ -1243,6 +1317,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     .vad-pill[data-kind="none"] { display: none; }
     .vad-pill[data-kind="silero"] { border-color: var(--aura-color-primary); color: var(--aura-color-primary); }
     .vad-pill[data-kind="energy"] { border-color: var(--aura-color-warning); color: var(--aura-color-warning); }
+    .vad-pill[data-kind="rnnoise"] { border-color: var(--aura-color-info); color: var(--aura-color-info); }
 
     .cg-transcript {
       flex: 1; overflow-y: auto;
