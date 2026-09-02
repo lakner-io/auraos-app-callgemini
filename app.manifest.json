@@ -1,0 +1,54 @@
+{
+  "id": "io.lakner.callgemini",
+  "name": "CallGemini",
+  "version": "0.1.0",
+  "description": "Voice-first chat with Gemini Live — talk, see the dialog transcribed live, and wire in your own MCP tools.",
+  "icon": "CG",
+  "category": "communication",
+  "instanceMode": "single",
+  "activityMode": "multi",
+  "backgroundService": true,
+  "sandbox": "container",
+  "themeStrategy": "inherit",
+  "permissions": [
+    "network.internet",
+    "storage.read",
+    "storage.write",
+    "system.notifications"
+  ],
+  "tools": [
+    "bash",
+    "curl",
+    "node",
+    "aura",
+    "claude",
+    "git",
+    "gh",
+    "oras"
+  ],
+  "viewConfig": {
+    "defaultWidth": 480,
+    "defaultHeight": 760,
+    "resizable": true
+  },
+  "keymapActions": [
+    {
+      "id": "toggle-call",
+      "label": "Start / end call",
+      "category": "Call",
+      "defaultCombo": "Ctrl+Shift+K"
+    },
+    {
+      "id": "mute",
+      "label": "Mute / unmute mic",
+      "category": "Call",
+      "defaultCombo": "Ctrl+Shift+M"
+    },
+    {
+      "id": "toggle-conversations",
+      "label": "Toggle conversations",
+      "category": "View",
+      "defaultCombo": "Ctrl+Shift+O"
+    }
+  ]
+}

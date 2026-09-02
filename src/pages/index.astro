@@ -1,0 +1,875 @@
+---
+// CallGemini — voice-first chat with Gemini Live. The backend WS bridge lives in
+// src/server/callBridge.mjs (attached in astro.config.mjs); this page is the UI
+// shell. The browser controller is inlined in the <script> below ON PURPOSE:
+// the shell proxy only rewrites `/@fs|/@vite|/@id|/node_modules` imports inside
+// served JS, NOT app-authored `/src/...` imports — so a cross-file
+// `import '../client/call.js'` would 404 in the iframe and no handlers attach.
+// Keeping the controller in one processed module avoids that `/src/` sub-import.
+const hasEnvKey = !!process.env.GEMINI_API_KEY;
+---
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CallGemini</title>
+</head>
+<body>
+  <div class="cg-app" data-role="app" data-sidebar="closed">
+    <!-- Conversations drawer (overlay) + backdrop -->
+    <aside class="cg-sidebar" data-role="sidebar" aria-label="Conversations">
+      <button class="btn new-chat-btn" data-action="new-chat" type="button">＋ New chat</button>
+      <div class="conv-list" data-role="conv-list"></div>
+    </aside>
+    <div class="cg-backdrop" data-role="sidebar-backdrop"></div>
+
+    <header class="cg-header">
+      <div class="cg-header-left">
+        <button class="icon-btn" data-action="toggle-sidebar" type="button" aria-label="Conversations" title="Conversations">☰</button>
+        <div class="cg-title">
+          <span class="cg-logo">CG</span>
+          <span>CallGemini</span>
+        </div>
+      </div>
+      <span class="status-pill" data-role="status" data-state="idle">Idle</span>
+    </header>
+
+    <main class="cg-transcript" data-role="transcript">
+      <div class="cg-empty" data-role="empty">
+        <p class="cg-empty-title">Press <strong>Call</strong> to talk to Gemini.</p>
+        <p class="cg-empty-sub">The conversation is transcribed here live. Configure your API key and MCP tools with the ⚙ button.</p>
+      </div>
+    </main>
+
+    <form class="cg-textbar" data-form="text">
+      <input class="text-input" data-role="text-input" type="text"
+             placeholder="Type a message (optional)…" autocomplete="off" />
+      <button class="btn btn-ghost" type="submit">Send</button>
+    </form>
+
+    <div class="cg-controls">
+      <button class="btn btn-icon" data-action="settings" type="button" title="Settings" aria-label="Settings">⚙</button>
+      <button class="btn call-btn" data-action="toggle-call" data-active="false" type="button">Call</button>
+      <button class="btn btn-ghost" data-action="mute" data-muted="false" type="button" disabled>Mute</button>
+    </div>
+
+    <!-- Settings modal -->
+    <div class="modal-overlay" data-role="settings-modal" data-open="false">
+      <div class="modal-panel">
+        <div class="modal-head">
+          <h2 class="modal-title">Settings</h2>
+          <button class="btn btn-icon" data-action="settings-close" type="button" aria-label="Close">✕</button>
+        </div>
+
+        <label class="field">
+          <span class="field-label">Gemini API key</span>
+          <input class="field-input" data-field="apiKey" type="password" placeholder={hasEnvKey ? 'Using GEMINI_API_KEY from Context — override here' : 'Paste your AI Studio key'} />
+        </label>
+
+        <label class="field">
+          <span class="field-label">Model</span>
+          <input class="field-input" data-field="model" type="text" />
+        </label>
+
+        <label class="field">
+          <span class="field-label">Voice</span>
+          <select class="field-input" data-field="voice"></select>
+        </label>
+
+        <label class="field">
+          <span class="field-label">System instruction</span>
+          <textarea class="field-input" data-field="systemInstruction" rows="3" placeholder="How Gemini should behave (optional)"></textarea>
+        </label>
+
+        <div class="field">
+          <span class="field-label">MCP servers (remote HTTP / SSE)</span>
+          <div class="mcp-list" data-role="mcp-list"></div>
+          <button class="btn btn-ghost btn-sm" data-action="mcp-add" type="button">+ Add MCP server</button>
+        </div>
+
+        <div class="modal-foot">
+          <button class="btn btn-ghost" data-action="settings-close" type="button">Cancel</button>
+          <button class="btn call-btn" data-action="settings-save" type="button">Save</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script define:vars={{ hasEnvKey }} is:inline>
+    window.GEMINI_API_KEY_PRESENT = hasEnvKey;
+  </script>
+  <script>
+    // ── CallGemini browser controller (inlined — see frontmatter note) ──────
+    // Owns the voice call end-to-end: mic capture → 16 kHz PCM over the WS,
+    // 24 kHz PCM playback, live transcript rendering, tool chips, settings, and
+    // config persistence. Elements are found by data-* hooks, styled by class;
+    // transcript rows are created here at runtime.
+    const APP_ID = 'io.lakner.callgemini';
+    const KV_URL = `/api/kv/app/${APP_ID}/config`; // absolute → shell KV route, app identified by Referer
+
+    const DEFAULTS = {
+      apiKey: '',
+      model: 'gemini-2.5-flash-native-audio-preview-12-2025',
+      voiceName: 'Kore',
+      systemInstruction: '',
+      mcpServers: [],
+    };
+    const VOICES = ['Puck', 'Charon', 'Kore', 'Fenrir', 'Aoede', 'Leda', 'Orus', 'Zephyr'];
+
+    const $ = (sel, root = document) => root.querySelector(sel);
+
+    const els = {
+      appEl: $('[data-role="app"]'),
+      sidebar: $('[data-role="sidebar"]'),
+      backdrop: $('[data-role="sidebar-backdrop"]'),
+      convList: $('[data-role="conv-list"]'),
+      toggleSidebarBtn: $('[data-action="toggle-sidebar"]'),
+      newChatBtn: $('[data-action="new-chat"]'),
+      status: $('[data-role="status"]'),
+      transcript: $('[data-role="transcript"]'),
+      callBtn: $('[data-action="toggle-call"]'),
+      muteBtn: $('[data-action="mute"]'),
+      settingsBtn: $('[data-action="settings"]'),
+      textForm: $('[data-form="text"]'),
+      textInput: $('[data-role="text-input"]'),
+      modal: $('[data-role="settings-modal"]'),
+      fApiKey: $('[data-field="apiKey"]'),
+      fModel: $('[data-field="model"]'),
+      fVoice: $('[data-field="voice"]'),
+      fSystem: $('[data-field="systemInstruction"]'),
+      mcpList: $('[data-role="mcp-list"]'),
+      mcpAdd: $('[data-action="mcp-add"]'),
+      settingsSave: $('[data-action="settings-save"]'),
+      settingsClose: $('[data-action="settings-close"]'),
+    };
+
+    let config = { ...DEFAULTS };
+    let ws = null;
+    let inCall = false;
+    let muted = false;
+    let activeConversationId = null; // null = new chat; set → resume on next call
+    let convRefreshTimer = null;
+    let captureCtx = null;
+    let captureStream = null;
+    let playbackCtx = null;
+    let playbackNode = null;
+    const activeBubbles = { user: null, model: null };
+    const toolChips = new Map();
+
+    async function loadConfig() {
+      try {
+        const res = await fetch(KV_URL);
+        if (res.ok) {
+          const { value } = await res.json();
+          if (value && typeof value === 'object') config = { ...DEFAULTS, ...value };
+        }
+      } catch { /* first run / offline — keep defaults */ }
+    }
+
+    async function saveConfig() {
+      try {
+        const res = await fetch(KV_URL, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ value: config }),
+        });
+        if (!res.ok) { console.error('[callgemini] config save failed:', res.status); return false; }
+        return true;
+      } catch (err) {
+        console.error('[callgemini] config save error:', err);
+        return false;
+      }
+    }
+
+    const STATUS_LABEL = {
+      idle: 'Idle', connecting: 'Connecting…', live: 'Live', ended: 'Call ended', error: 'Error',
+    };
+
+    function setStatus(state, message) {
+      if (els.status) {
+        els.status.dataset.state = state;
+        els.status.textContent = message ? `${STATUS_LABEL[state] ?? state} · ${message}` : (STATUS_LABEL[state] ?? state);
+      }
+    }
+
+    function scrollDown() {
+      if (els.transcript) els.transcript.scrollTop = els.transcript.scrollHeight;
+    }
+
+    function clearEmpty() {
+      const empty = els.transcript?.querySelector('[data-role="empty"]');
+      if (empty) empty.remove();
+    }
+
+    function createBubble(role) {
+      clearEmpty();
+      const row = document.createElement('div');
+      row.className = 'msg-row';
+      row.dataset.role = role;
+      const bubble = document.createElement('div');
+      bubble.className = 'msg-bubble';
+      const txt = document.createElement('span');
+      txt.className = 'msg-text';
+      bubble.appendChild(txt);
+      row.appendChild(bubble);
+      els.transcript.appendChild(row);
+      scrollDown();
+      return { row, textEl: txt };
+    }
+
+    function appendTranscript(role, text) {
+      if (!activeBubbles[role]) activeBubbles[role] = createBubble(role);
+      activeBubbles[role].textEl.textContent += text;
+      scrollDown();
+    }
+
+    function finalizeTurn() {
+      activeBubbles.user = null;
+      activeBubbles.model = null;
+    }
+
+    function systemLine(text, kind = 'info') {
+      clearEmpty();
+      const row = document.createElement('div');
+      row.className = 'sys-line';
+      row.dataset.kind = kind;
+      row.textContent = text;
+      els.transcript.appendChild(row);
+      scrollDown();
+    }
+
+    function toolChip(name, phase, error) {
+      let chip = toolChips.get(name);
+      if (!chip || phase === 'running') {
+        chip = document.createElement('div');
+        chip.className = 'tool-chip';
+        els.transcript.appendChild(chip);
+        toolChips.set(name, chip);
+      }
+      chip.dataset.phase = phase;
+      chip.textContent = phase === 'running' ? `⚙ ${name}…` : (error ? `✗ ${name} — ${error}` : `✓ ${name}`);
+      if (error) chip.dataset.error = 'true';
+      scrollDown();
+    }
+
+    function wsUrl() {
+      const id = window.AURA_INSTANCE_ID
+        || document.querySelector('meta[name="aura-instance-id"]')?.content
+        || APP_ID;
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      return `${proto}//${location.host}/api/proxy/${id}/ws`;
+    }
+
+    function openWs() {
+      return new Promise((resolve, reject) => {
+        const sock = new WebSocket(wsUrl());
+        sock.binaryType = 'arraybuffer';
+        sock.addEventListener('open', () => resolve(sock));
+        sock.addEventListener('error', (e) => reject(e));
+        sock.addEventListener('message', onWsMessage);
+        sock.addEventListener('close', () => { if (inCall) endCall('socket-closed'); });
+      });
+    }
+
+    function onWsMessage(ev) {
+      if (typeof ev.data !== 'string') {
+        if (playbackNode) playbackNode.port.postMessage(ev.data, [ev.data]);
+        return;
+      }
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch { return; }
+      switch (msg.type) {
+        case 'status':
+          setStatus(msg.state, msg.message);
+          if (msg.state === 'error' && msg.message) systemLine(msg.message, 'error');
+          break;
+        case 'transcript':
+          appendTranscript(msg.role, msg.text);
+          break;
+        case 'turnComplete':
+          finalizeTurn();
+          break;
+        case 'interrupted':
+          if (playbackNode) playbackNode.port.postMessage('clear');
+          break;
+        case 'tool':
+          toolChip(msg.name, msg.phase, msg.error);
+          break;
+        case 'conversation':
+          // The server tells us which conversation this call records (a fresh
+          // call learns its new id here) and its (maybe just-derived) title.
+          activeConversationId = msg.id;
+          updateActiveConvHighlight();
+          scheduleConvRefresh();
+          break;
+        default:
+          break;
+      }
+    }
+
+    async function startCapture() {
+      captureStream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      captureCtx = new AudioContext();
+      await captureCtx.audioWorklet.addModule('worklets/capture-worklet.js');
+      const source = captureCtx.createMediaStreamSource(captureStream);
+      const node = new AudioWorkletNode(captureCtx, 'capture-worklet');
+      node.port.onmessage = (e) => {
+        if (!muted && ws && ws.readyState === WebSocket.OPEN) ws.send(e.data);
+      };
+      // A worklet is only pulled if it feeds a sink — route through a muted gain
+      // so the mic never echoes to the speakers.
+      const sink = captureCtx.createGain();
+      sink.gain.value = 0;
+      source.connect(node).connect(sink).connect(captureCtx.destination);
+    }
+
+    async function startPlayback() {
+      playbackCtx = new AudioContext({ sampleRate: 24000 });
+      await playbackCtx.audioWorklet.addModule('worklets/playback-worklet.js');
+      playbackNode = new AudioWorkletNode(playbackCtx, 'playback-worklet');
+      playbackNode.connect(playbackCtx.destination);
+    }
+
+    function stopAudio() {
+      try { captureStream?.getTracks().forEach((t) => t.stop()); } catch { /* noop */ }
+      try { captureCtx?.close(); } catch { /* noop */ }
+      try { playbackCtx?.close(); } catch { /* noop */ }
+      captureStream = null; captureCtx = null; playbackCtx = null; playbackNode = null;
+    }
+
+    async function startCall() {
+      if (inCall) return;
+      inCall = true;
+      muted = false;
+      updateControls();
+      setStatus('connecting');
+      try {
+        ws = await openWs();
+        // conversationId set → resume that conversation with its history as context.
+        ws.send(JSON.stringify({ type: 'start', config, conversationId: activeConversationId }));
+        await startPlayback();
+        await startCapture();
+        systemLine('Call started', 'info');
+      } catch (err) {
+        console.error('[callgemini] startCall failed:', err);
+        systemLine(`Could not start call: ${err?.message ?? err}`, 'error');
+        endCall('start-failed');
+      }
+    }
+
+    function endCall(_reason) {
+      if (!inCall) return;
+      inCall = false;
+      try { ws?.readyState === WebSocket.OPEN && ws.send(JSON.stringify({ type: 'stop' })); } catch { /* noop */ }
+      try { ws?.close(); } catch { /* noop */ }
+      ws = null;
+      stopAudio();
+      finalizeTurn();
+      toolChips.clear();
+      setStatus('ended');
+      updateControls();
+    }
+
+    function toggleCall() {
+      if (inCall) endCall('user'); else startCall();
+    }
+
+    function toggleMute() {
+      if (!inCall) return;
+      muted = !muted;
+      updateControls();
+    }
+
+    function updateControls() {
+      if (els.callBtn) {
+        els.callBtn.dataset.active = String(inCall);
+        els.callBtn.textContent = inCall ? 'End call' : 'Call';
+      }
+      if (els.muteBtn) {
+        els.muteBtn.disabled = !inCall;
+        els.muteBtn.dataset.muted = String(muted);
+        els.muteBtn.textContent = muted ? 'Unmute' : 'Mute';
+      }
+    }
+
+    function renderMcpRows() {
+      els.mcpList.textContent = '';
+      config.mcpServers.forEach((srv, idx) => {
+        const row = document.createElement('div');
+        row.className = 'mcp-row';
+        row.dataset.idx = String(idx);
+
+        const url = document.createElement('input');
+        url.className = 'field-input mcp-url';
+        url.type = 'url';
+        url.placeholder = 'https://server/mcp';
+        url.value = srv.url ?? '';
+        url.dataset.k = 'url';
+
+        const transport = document.createElement('select');
+        transport.className = 'field-input mcp-transport';
+        transport.dataset.k = 'transport';
+        for (const t of ['http', 'sse']) {
+          const opt = document.createElement('option');
+          opt.value = t; opt.textContent = t.toUpperCase();
+          if ((srv.transport ?? 'http') === t) opt.selected = true;
+          transport.appendChild(opt);
+        }
+
+        const del = document.createElement('button');
+        del.type = 'button';
+        del.className = 'btn-del';
+        del.dataset.action = 'mcp-del';
+        del.textContent = 'Remove';
+
+        row.append(url, transport, del);
+        els.mcpList.appendChild(row);
+      });
+    }
+
+    function readMcpRows() {
+      const rows = [...els.mcpList.querySelectorAll('.mcp-row')];
+      return rows.map((row) => ({
+        url: row.querySelector('.mcp-url').value.trim(),
+        transport: row.querySelector('.mcp-transport').value,
+      })).filter((s) => s.url);
+    }
+
+    function openSettings() {
+      els.fApiKey.value = config.apiKey ?? '';
+      els.fModel.value = config.model ?? DEFAULTS.model;
+      els.fSystem.value = config.systemInstruction ?? '';
+      els.fVoice.textContent = '';
+      for (const v of VOICES) {
+        const opt = document.createElement('option');
+        opt.value = v; opt.textContent = v;
+        if ((config.voiceName ?? DEFAULTS.voiceName) === v) opt.selected = true;
+        els.fVoice.appendChild(opt);
+      }
+      renderMcpRows();
+      els.modal.dataset.open = 'true';
+    }
+
+    function closeSettings() {
+      els.modal.dataset.open = 'false';
+    }
+
+    function saveSettings() {
+      config = {
+        ...config,
+        apiKey: els.fApiKey.value.trim(),
+        model: els.fModel.value.trim() || DEFAULTS.model,
+        voiceName: els.fVoice.value || DEFAULTS.voiceName,
+        systemInstruction: els.fSystem.value.trim(),
+        mcpServers: readMcpRows(),
+      };
+      // Close immediately — never block the dialog on the network round-trip.
+      // The in-memory config is already updated and is what a call uses; the
+      // KV write only matters for persistence across reloads.
+      closeSettings();
+      systemLine('Settings saved', 'info');
+      saveConfig().then((ok) => {
+        if (ok === false) systemLine('Kept for this session, but could not persist settings.', 'error');
+      });
+    }
+
+    // ── Conversations sidebar (overlay drawer) ──────────────────────────────
+    function isSidebarOpen() { return els.appEl?.dataset.sidebar === 'open'; }
+    function openSidebar() { if (els.appEl) els.appEl.dataset.sidebar = 'open'; refreshConvList(); }
+    function closeSidebar() { if (els.appEl) els.appEl.dataset.sidebar = 'closed'; }
+    function toggleSidebar() { if (isSidebarOpen()) closeSidebar(); else openSidebar(); }
+
+    function relativeTime(ts) {
+      if (!ts) return '';
+      const s = Math.floor((Date.now() - ts) / 1000);
+      if (s < 60) return 'just now';
+      const m = Math.floor(s / 60); if (m < 60) return `${m}m ago`;
+      const h = Math.floor(m / 60); if (h < 24) return `${h}h ago`;
+      const d = Math.floor(h / 24); if (d < 7) return `${d}d ago`;
+      return new Date(ts).toLocaleDateString();
+    }
+
+    function updateActiveConvHighlight() {
+      els.convList?.querySelectorAll('.conv-item').forEach((el) => {
+        if (el.dataset.id === activeConversationId) el.dataset.active = 'true';
+        else delete el.dataset.active;
+      });
+    }
+
+    function renderConvList(items) {
+      els.convList.textContent = '';
+      if (!items.length) {
+        const empty = document.createElement('div');
+        empty.className = 'conv-empty';
+        empty.textContent = 'No conversations yet';
+        els.convList.appendChild(empty);
+        return;
+      }
+      for (const it of items) {
+        const row = document.createElement('div');
+        row.className = 'conv-item';
+        row.dataset.id = it.id;
+        if (it.id === activeConversationId) row.dataset.active = 'true';
+
+        const main = document.createElement('div');
+        main.className = 'conv-main';
+        const title = document.createElement('div');
+        title.className = 'conv-title';
+        title.textContent = it.title || 'New conversation';
+        const time = document.createElement('div');
+        time.className = 'conv-time';
+        time.textContent = relativeTime(it.updatedAt);
+        main.append(title, time);
+
+        const del = document.createElement('button');
+        del.type = 'button';
+        del.className = 'conv-del';
+        del.dataset.action = 'conv-del';
+        del.setAttribute('aria-label', 'Delete');
+        del.textContent = '✕';
+
+        row.append(main, del);
+        els.convList.appendChild(row);
+      }
+    }
+
+    async function refreshConvList() {
+      try {
+        const res = await fetch('api/conversations');
+        if (res.ok) renderConvList(await res.json());
+      } catch { /* offline — leave list as-is */ }
+    }
+
+    // Debounced refresh while a call streams turns (title/order change server-side).
+    function scheduleConvRefresh() {
+      if (convRefreshTimer) return;
+      convRefreshTimer = setTimeout(() => {
+        convRefreshTimer = null;
+        if (isSidebarOpen()) refreshConvList();
+      }, 1500);
+    }
+
+    function showEmptyState() {
+      els.transcript.innerHTML =
+        '<div class="cg-empty" data-role="empty">' +
+        '<p class="cg-empty-title">Press <strong>Call</strong> to talk to Gemini.</p>' +
+        '<p class="cg-empty-sub">The conversation is transcribed here live. Configure your API key and MCP tools with the ⚙ button.</p>' +
+        '</div>';
+    }
+
+    function clearTranscript() {
+      els.transcript.innerHTML = '';
+      activeBubbles.user = null; activeBubbles.model = null;
+      toolChips.clear();
+    }
+
+    async function loadConversation(id) {
+      if (inCall) endCall('load-history');
+      try {
+        const res = await fetch(`api/conversations/${id}`);
+        if (!res.ok) { systemLine('Could not load that conversation', 'error'); return; }
+        const conv = await res.json();
+        clearTranscript();
+        for (const t of conv.turns ?? []) {
+          const b = createBubble(t.role);
+          b.textEl.textContent = t.text;
+        }
+        activeConversationId = id;
+        setStatus('idle');
+        systemLine('Loaded — press Call to continue this conversation', 'info');
+        closeSidebar();
+        updateActiveConvHighlight();
+      } catch {
+        systemLine('Could not load that conversation', 'error');
+      }
+    }
+
+    function newChat() {
+      if (inCall) endCall('new-chat');
+      activeConversationId = null;
+      showEmptyState();
+      activeBubbles.user = null; activeBubbles.model = null; toolChips.clear();
+      setStatus('idle');
+      closeSidebar();
+      updateActiveConvHighlight();
+    }
+
+    async function deleteConversation(id) {
+      try { await fetch(`api/conversations/${id}`, { method: 'DELETE' }); } catch { /* ignore */ }
+      if (id === activeConversationId) newChat();
+      refreshConvList();
+    }
+
+    els.toggleSidebarBtn?.addEventListener('click', toggleSidebar);
+    els.newChatBtn?.addEventListener('click', newChat);
+    els.backdrop?.addEventListener('click', closeSidebar);
+    els.convList?.addEventListener('click', (e) => {
+      const item = e.target.closest('.conv-item');
+      if (!item) return;
+      const id = item.dataset.id;
+      if (e.target.closest('[data-action="conv-del"]')) { e.stopPropagation(); deleteConversation(id); return; }
+      loadConversation(id);
+    });
+
+    els.callBtn?.addEventListener('click', toggleCall);
+    els.muteBtn?.addEventListener('click', toggleMute);
+    els.settingsBtn?.addEventListener('click', openSettings);
+    els.settingsSave?.addEventListener('click', saveSettings);
+    // Two elements carry data-action="settings-close" (the ✕ and the Cancel
+    // button); querySelector would only bind the first. Delegate on the modal
+    // so BOTH close it — and a click on the backdrop (outside the panel) too.
+    els.modal?.addEventListener('click', (e) => {
+      if (e.target.closest('[data-action="settings-close"]') || e.target === els.modal) {
+        closeSettings();
+      }
+    });
+    els.mcpAdd?.addEventListener('click', () => {
+      config.mcpServers = readMcpRows();
+      config.mcpServers.push({ url: '', transport: 'http' });
+      renderMcpRows();
+    });
+    // Delegated remove for dynamically-rendered MCP rows.
+    els.mcpList?.addEventListener('click', (e) => {
+      const del = e.target.closest('[data-action="mcp-del"]');
+      if (!del) return;
+      const idx = Number(del.closest('.mcp-row')?.dataset.idx);
+      config.mcpServers = readMcpRows().filter((_, i) => i !== idx);
+      renderMcpRows();
+    });
+    els.textForm?.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const text = els.textInput.value.trim();
+      if (!text) return;
+      if (!inCall) { systemLine('Start a call to send a message', 'error'); return; }
+      ws?.send(JSON.stringify({ type: 'text', text }));
+      els.textInput.value = '';
+    });
+
+    // OS keymap actions + Back. Dynamically imported so an SDK resolution
+    // hiccup can't break the (already-wired) core controller. The bare
+    // specifier resolves to a /node_modules|@fs URL the proxy DOES rewrite.
+    import('@aura/app-sdk').then(({ OsClient }) => {
+      const osClient = new OsClient();
+      osClient.keymap.on('toggle-call', toggleCall);
+      osClient.keymap.on('mute', toggleMute);
+      osClient.keymap.on('toggle-conversations', toggleSidebar);
+      osClient.nav.onBack((e) => {
+        if (inCall) { e.preventDefault(); endCall('os-back'); }
+      });
+    }).catch(() => { /* running outside the OS shell */ });
+
+    // Boot.
+    setStatus('idle');
+    updateControls();
+    loadConfig().then(() => {
+      if (!config.apiKey && !window.GEMINI_API_KEY_PRESENT) {
+        systemLine('No Gemini API key set. Open Settings (⚙) to add one, or set GEMINI_API_KEY in AuraOS Context.', 'info');
+      }
+    });
+  </script>
+
+  <!--
+    Transcript rows, tool chips and MCP setting rows are created at runtime by
+    call.js (createElement, not innerHTML), so their styles MUST be global —
+    Astro's scoped `data-astro-cid-*` attribute is never stamped on runtime DOM.
+    Everything is namespaced under `.cg-app` to avoid leaking into OS chrome.
+  -->
+  <style is:global>
+    :root { color-scheme: light dark; }
+    html, body { margin: 0; height: 100%; }
+    body {
+      font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+      background: var(--aura-color-bg);
+      color: var(--aura-color-text);
+    }
+
+    .cg-app {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      background: var(--aura-color-bg);
+      color: var(--aura-color-text);
+      position: relative;   /* positioning context for the overlay drawer */
+      overflow: hidden;
+    }
+
+    /* ── Conversations drawer (overlay) ─────────────────────────────────── */
+    .cg-sidebar {
+      position: absolute; top: 0; left: 0; bottom: 0; z-index: 30;
+      width: 260px; max-width: 84%;
+      display: flex; flex-direction: column; gap: 8px;
+      padding: 12px; box-sizing: border-box;
+      background: var(--aura-color-surface);
+      border-right: 1px solid var(--aura-color-border);
+      transform: translateX(-100%);
+      transition: transform 0.2s ease;
+    }
+    .cg-app[data-sidebar="open"] .cg-sidebar { transform: translateX(0); }
+    .cg-backdrop {
+      position: absolute; inset: 0; z-index: 20;
+      background: color-mix(in srgb, var(--aura-color-bg) 55%, transparent);
+      opacity: 0; pointer-events: none; transition: opacity 0.2s ease;
+    }
+    .cg-app[data-sidebar="open"] .cg-backdrop { opacity: 1; pointer-events: auto; }
+
+    .new-chat-btn { width: 100%; text-align: left; }
+    .conv-list { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
+    .conv-empty { color: var(--aura-color-text-dim); font-size: 13px; text-align: center; padding: 16px 8px; }
+    .conv-item {
+      display: flex; align-items: center; gap: 6px;
+      padding: 8px 10px; border-radius: 8px; cursor: pointer;
+      border: 1px solid transparent;
+    }
+    .conv-item:hover { background: var(--aura-color-surface-2); }
+    .conv-item[data-active="true"] { background: var(--aura-color-surface-2); border-color: var(--aura-color-primary); }
+    .conv-main { flex: 1; min-width: 0; }
+    .conv-title {
+      font-size: 13px; font-weight: 600;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .conv-time { font-size: 11px; color: var(--aura-color-text-dim); }
+    .conv-del {
+      flex: 0 0 auto; font: inherit; font-size: 12px; line-height: 1; cursor: pointer;
+      border: none; background: transparent; color: var(--aura-color-text-dim);
+      padding: 4px 6px; border-radius: 6px; opacity: 0;
+    }
+    .conv-item:hover .conv-del { opacity: 1; }
+    .conv-del:hover { color: var(--aura-color-danger); background: var(--aura-color-surface); }
+
+    .cg-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--aura-color-border);
+      background: var(--aura-color-surface);
+    }
+    .cg-header-left { display: flex; align-items: center; gap: 10px; }
+    .icon-btn {
+      font: inherit; font-size: 18px; line-height: 1; cursor: pointer;
+      border: 1px solid var(--aura-color-border); border-radius: 8px;
+      background: var(--aura-color-surface-2); color: var(--aura-color-text);
+      padding: 5px 9px;
+    }
+    .icon-btn:hover { border-color: var(--aura-color-primary); }
+    .cg-title { display: flex; align-items: center; gap: 10px; font-weight: 600; }
+    .cg-logo {
+      display: inline-grid; place-items: center;
+      width: 28px; height: 28px; border-radius: 8px;
+      background: var(--aura-color-primary); color: var(--aura-color-bg);
+      font-size: 12px; font-weight: 700;
+    }
+
+    .status-pill {
+      font-size: 12px; font-weight: 600;
+      padding: 4px 10px; border-radius: 999px;
+      background: var(--aura-color-surface-2); color: var(--aura-color-text-dim);
+      border: 1px solid var(--aura-color-border);
+    }
+    .status-pill[data-state="live"] { background: var(--aura-color-success); color: var(--aura-color-bg); border-color: transparent; }
+    .status-pill[data-state="connecting"] { background: var(--aura-color-info); color: var(--aura-color-bg); border-color: transparent; }
+    .status-pill[data-state="error"] { background: var(--aura-color-danger); color: var(--aura-color-bg); border-color: transparent; }
+
+    .cg-transcript {
+      flex: 1; overflow-y: auto;
+      padding: 16px; display: flex; flex-direction: column; gap: 10px;
+    }
+    .cg-empty { margin: auto; text-align: center; color: var(--aura-color-text-dim); max-width: 340px; }
+    .cg-empty-title { font-size: 15px; margin: 0 0 6px; color: var(--aura-color-text); }
+    .cg-empty-sub { font-size: 13px; margin: 0; }
+
+    .msg-row { display: flex; }
+    .msg-row[data-role="user"] { justify-content: flex-end; }
+    .msg-row[data-role="model"] { justify-content: flex-start; }
+    .msg-bubble {
+      max-width: 78%; padding: 9px 13px; border-radius: 14px;
+      font-size: 14px; line-height: 1.45; white-space: pre-wrap; word-break: break-word;
+    }
+    .msg-row[data-role="user"] .msg-bubble { background: var(--aura-color-primary); color: var(--aura-color-bg); border-bottom-right-radius: 4px; }
+    .msg-row[data-role="model"] .msg-bubble { background: var(--aura-color-surface-2); color: var(--aura-color-text); border-bottom-left-radius: 4px; }
+
+    .sys-line { text-align: center; font-size: 12px; color: var(--aura-color-text-dim); }
+    .sys-line[data-kind="error"] { color: var(--aura-color-danger); }
+
+    .tool-chip {
+      align-self: center; font-size: 12px;
+      padding: 3px 10px; border-radius: 999px;
+      background: var(--aura-color-surface); border: 1px solid var(--aura-color-border);
+      color: var(--aura-color-text-dim);
+    }
+    .tool-chip[data-error="true"] { border-color: var(--aura-color-danger); color: var(--aura-color-danger); }
+
+    .cg-textbar {
+      display: flex; gap: 8px; padding: 8px 12px;
+      border-top: 1px solid var(--aura-color-border); background: var(--aura-color-surface);
+    }
+    .text-input, .field-input {
+      background: var(--aura-color-bg); color: var(--aura-color-text);
+      border: 1px solid var(--aura-color-border); border-radius: 8px;
+      padding: 8px 10px; font: inherit; font-size: 14px;
+    }
+    .text-input { flex: 1; }
+    .text-input:focus, .field-input:focus { outline: none; border-color: var(--aura-color-primary); }
+
+    .cg-controls {
+      display: flex; align-items: center; gap: 10px;
+      padding: 12px 16px 16px; border-top: 1px solid var(--aura-color-border);
+      background: var(--aura-color-surface);
+    }
+
+    .btn {
+      font: inherit; font-size: 14px; font-weight: 600;
+      border-radius: 10px; border: 1px solid var(--aura-color-border);
+      padding: 9px 16px; cursor: pointer;
+      background: var(--aura-color-surface-2); color: var(--aura-color-text);
+    }
+    .btn:disabled { opacity: 0.5; cursor: default; }
+    .btn-ghost { background: transparent; }
+    .btn-sm { padding: 6px 10px; font-size: 13px; }
+    .btn-icon { padding: 9px 12px; }
+
+    .call-btn {
+      flex: 1; background: var(--aura-color-primary); color: var(--aura-color-bg);
+      border-color: transparent; font-size: 15px; padding: 11px 16px;
+    }
+    .call-btn[data-active="true"] { background: var(--aura-color-danger); }
+
+    /* Settings modal */
+    .modal-overlay {
+      position: fixed; inset: 0; display: none;
+      align-items: center; justify-content: center; padding: 20px;
+      background: color-mix(in srgb, var(--aura-color-bg) 70%, transparent);
+    }
+    .modal-overlay[data-open="true"] { display: flex; }
+    .modal-panel {
+      width: 100%; max-width: 460px; max-height: 88vh; overflow-y: auto;
+      display: flex; flex-direction: column; gap: 14px;
+      background: var(--aura-color-surface); color: var(--aura-color-text);
+      border: 1px solid var(--aura-color-border); border-radius: 14px; padding: 18px;
+    }
+    .modal-head, .modal-foot { display: flex; align-items: center; justify-content: space-between; }
+    .modal-foot { gap: 10px; }
+    .modal-foot .call-btn { flex: 0 0 auto; }
+    .modal-title { margin: 0; font-size: 16px; }
+
+    .field { display: flex; flex-direction: column; gap: 6px; }
+    .field-label { font-size: 12px; font-weight: 600; color: var(--aura-color-text-dim); }
+    textarea.field-input { resize: vertical; }
+
+    .mcp-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 6px; }
+    .mcp-row { display: flex; gap: 6px; align-items: center; }
+    .mcp-url { flex: 1; }
+    .mcp-transport { flex: 0 0 auto; }
+    .btn-del {
+      font: inherit; font-size: 12px; font-weight: 600; cursor: pointer;
+      padding: 6px 10px; border-radius: 8px;
+      background: transparent; color: var(--aura-color-danger);
+      border: 1px solid var(--aura-color-border);
+    }
+  </style>
+</body>
+</html>

@@ -1,0 +1,17 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build output
+dist/
+.astro/
+
+# App-local runtime data (conversations, sessions) — never committed
+data/
+/data/
+# Stray nested dir the running instance writes conversation data into
+/io.lakner.callgemini/
+
+# Logs / misc
+*.log
+.DS_Store
