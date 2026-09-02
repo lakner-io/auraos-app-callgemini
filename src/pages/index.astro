@@ -323,6 +323,8 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
           break;
         case 'turnComplete':
           finalizeTurn();
+          // Play out any tail audio smaller than the jitter cushion.
+          if (playbackNode) playbackNode.port.postMessage('flush');
           break;
         case 'interrupted':
           if (playbackNode) playbackNode.port.postMessage('clear');
@@ -403,6 +405,11 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
         vadStartRun = prob >= VAD_START_PROB ? vadStartRun + 1 : 0;
         if (vadStartRun >= VAD_START_WINDOWS) {
           vadSpeaking = true; vadSilenceMs = 0;
+          // Instant local barge-in: silence Gemini the moment the user speaks
+          // instead of waiting for the server's `interrupted` round-trip. The
+          // activityStart below is the server-side interrupt (the Live API
+          // default is START_OF_ACTIVITY_INTERRUPTS).
+          playbackNode?.port.postMessage('clear');
           ws?.send(JSON.stringify({ type: 'vad', event: 'start' }));
           for (const b of preRoll) sendFrame(b);   // don't clip the utterance onset
           preRoll.length = 0;
