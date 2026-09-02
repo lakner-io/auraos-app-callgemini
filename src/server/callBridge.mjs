@@ -105,8 +105,21 @@ export class CallSession {
     switch (msg?.type) {
       case 'start':   await this.start(msg.config ?? {}, msg.conversationId); break;
       case 'text':    this.sendText(msg.text ?? ''); break;
+      case 'vad':     this.sendActivitySignal(msg.event); break;
       case 'stop':    this.stopGemini('user-stop'); break;
       default: break;
+    }
+  }
+
+  /** Browser-VAD mode: relay the client's speech start/end as explicit activity
+   * signals (server-side automatic detection is disabled for these calls). */
+  sendActivitySignal(event) {
+    if (!this.session) return;
+    try {
+      if (event === 'start') this.session.sendRealtimeInput({ activityStart: {} });
+      else if (event === 'end') this.session.sendRealtimeInput({ activityEnd: {} });
+    } catch (err) {
+      console.error('[callgemini] activity signal failed:', err?.message ?? err);
     }
   }
 
@@ -159,30 +172,46 @@ export class CallSession {
       // Keep per-turn latency flat over a long call — the server rolls the
       // context window instead of reprocessing all accumulated audio tokens.
       contextWindowCompression: { slidingWindow: {} },
-      // Commit end-of-speech sooner so the input transcript + reply come faster.
-      realtimeInputConfig: {
-        automaticActivityDetection: {
-          startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_HIGH,
-          endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_HIGH,
-          prefixPaddingMs: 100,
-          silenceDurationMs,
-        },
-      },
+      // Voice detection (Settings): 'browser' = client-side Silero VAD sends
+      // explicit activityStart/activityEnd signals, so server detection is off.
+      // 'server' (default) = tuned automatic detection: commit end-of-speech
+      // sooner so the input transcript + reply come faster.
+      realtimeInputConfig: config.vadMode === 'browser'
+        ? { automaticActivityDetection: { disabled: true } }
+        : {
+            automaticActivityDetection: {
+              startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_HIGH,
+              endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_HIGH,
+              prefixPaddingMs: 100,
+              silenceDurationMs,
+            },
+          },
+      // The native-audio model is thinking-capable and reasons before it
+      // speaks; 0 disables that (docs: "0 is DISABLED"). Guarded by model id —
+      // the API errors if set on a model without thinking support (and
+      // live.connect below retries once without it if the guard guessed wrong).
+      ...(model.includes('native-audio') ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
       ...(decls.length ? { tools: [{ functionDeclarations: decls }] } : {}),
     };
 
     try {
       const genai = new GoogleGenAI({ apiKey, httpOptions: { apiVersion: 'v1beta' } });
-      this.session = await genai.live.connect({
-        model,
-        callbacks: {
-          onopen: () => this.emit({ type: 'status', state: 'live' }),
-          onmessage: (message) => this.onServerMessage(message),
-          onerror: (e) => this.emit({ type: 'status', state: 'error', message: e?.message ?? 'Gemini stream error' }),
-          onclose: () => { if (!this.closed) this.emit({ type: 'status', state: 'ended' }); },
-        },
-        config: liveConfig,
-      });
+      const callbacks = {
+        onopen: () => this.emit({ type: 'status', state: 'live' }),
+        onmessage: (message) => this.onServerMessage(message),
+        onerror: (e) => this.emit({ type: 'status', state: 'error', message: e?.message ?? 'Gemini stream error' }),
+        onclose: () => { if (!this.closed) this.emit({ type: 'status', state: 'ended' }); },
+      };
+      try {
+        this.session = await genai.live.connect({ model, callbacks, config: liveConfig });
+      } catch (err) {
+        // The thinking guard keys off the model id; if this id doesn't actually
+        // support thinking the API rejects the config — retry once without it.
+        if (!liveConfig.thinkingConfig) throw err;
+        console.error('[callgemini] connect with thinkingConfig failed, retrying without:', err?.message ?? err);
+        const { thinkingConfig, ...rest } = liveConfig;
+        this.session = await genai.live.connect({ model, callbacks, config: rest });
+      }
 
       // Resume: replay prior turns as context WITHOUT eliciting a reply
       // (turnComplete:false) so Gemini continues where the conversation left off

@@ -67,9 +67,10 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
           <input class="field-input" data-field="apiKey" type="password" placeholder={hasEnvKey ? 'Using GEMINI_API_KEY from Context — override here' : 'Paste your AI Studio key'} />
         </label>
 
-        <label class="field">
+        <label class="field" data-role="model-field">
           <span class="field-label">Model</span>
-          <input class="field-input" data-field="model" type="text" />
+          <select class="field-input" data-field="modelPreset"></select>
+          <input class="field-input model-custom" data-field="model" type="text" placeholder="custom model id" />
         </label>
 
         <label class="field">
@@ -78,9 +79,15 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
         </label>
 
         <label class="field">
+          <span class="field-label">Voice detection</span>
+          <select class="field-input" data-field="vadMode"></select>
+          <span class="field-hint">Server = Gemini detects your speech (simple). Browser = local Silero VAD signals it explicitly — fastest, downloads ~16 MB once. Applies to your next call.</span>
+        </label>
+
+        <label class="field">
           <span class="field-label">Responsiveness</span>
           <select class="field-input" data-field="responsiveness"></select>
-          <span class="field-hint">How soon Gemini decides you've stopped talking. Lower = faster replies, but may cut you off mid-pause. Applies to your next call.</span>
+          <span class="field-hint">How soon you count as “done talking” (both detection modes). Lower = faster replies, but may cut you off mid-pause. Applies to your next call.</span>
         </label>
 
         <label class="field">
@@ -119,13 +126,24 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       model: 'gemini-2.5-flash-native-audio-preview-12-2025',
       voiceName: 'Kore',
       systemInstruction: '',
-      responsiveness: 'balanced', // snappy | balanced | relaxed — end-of-speech VAD window
+      responsiveness: 'balanced', // snappy | balanced | relaxed — end-of-speech window
+      vadMode: 'server',          // 'server' (automatic detection) | 'browser' (local Silero VAD)
       mcpServers: [],
     };
     const RESPONSIVENESS_OPTS = [
       { value: 'snappy', label: 'Snappy · 350ms' },
       { value: 'balanced', label: 'Balanced · 600ms' },
       { value: 'relaxed', label: 'Relaxed · 1000ms' },
+    ];
+    const RESPONSIVENESS_MS = { snappy: 350, balanced: 600, relaxed: 1000 };
+    const MODEL_PRESETS = [
+      { value: 'gemini-2.5-flash-native-audio-preview-12-2025', label: 'Native audio (expressive)' },
+      { value: 'gemini-live-2.5-flash-preview', label: 'Half-cascade (fastest)' },
+      { value: 'custom', label: 'Custom…' },
+    ];
+    const VAD_MODE_OPTS = [
+      { value: 'server', label: 'Server (simple)' },
+      { value: 'browser', label: 'Browser (Silero — fastest)' },
     ];
     const VOICES = ['Puck', 'Charon', 'Kore', 'Fenrir', 'Aoede', 'Leda', 'Orus', 'Zephyr'];
 
@@ -148,7 +166,10 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       modal: $('[data-role="settings-modal"]'),
       fApiKey: $('[data-field="apiKey"]'),
       fModel: $('[data-field="model"]'),
+      fModelPreset: $('[data-field="modelPreset"]'),
+      modelField: $('[data-role="model-field"]'),
       fVoice: $('[data-field="voice"]'),
+      fVadMode: $('[data-field="vadMode"]'),
       fResponsiveness: $('[data-field="responsiveness"]'),
       fSystem: $('[data-field="systemInstruction"]'),
       mcpList: $('[data-role="mcp-list"]'),
@@ -321,6 +342,108 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       }
     }
 
+    // ── Browser VAD (Silero v5 via onnxruntime-web) ─────────────────────────
+    // Loaded lazily, only for calls with vadMode==='browser'. The model + wasm
+    // ship in public/vad/ (relative fetches resolve under the proxy base href).
+    // Inference contract mirrors @ricky0123/vad-web's SileroV5 driver:
+    // input [1,512] f32 @16 kHz, recurrent state [2,1,128], sr int64; outputs
+    // `output` (speech prob) + `stateN`.
+    const VAD_WINDOW = 512;                 // 32 ms @ 16 kHz
+    const VAD_START_PROB = 0.5;
+    const VAD_END_PROB = 0.35;
+    const VAD_START_WINDOWS = 2;            // consecutive windows to commit speech-start
+    const VAD_PREROLL_FRAMES = 15;          // ~300 ms of 20 ms frames sent on speech-start
+    let vadEngine = null;                   // cached across calls
+    let vadActive = false;                  // this call runs browser VAD
+    let vadSpeaking = false;
+    let vadStartRun = 0;
+    let vadSilenceMs = 0;
+    let vadAccum = new Float32Array(0);     // pending samples until a 512 window fills
+    let vadBusy = false;
+    const preRoll = [];                     // recent ArrayBuffers while silent
+
+    async function initBrowserVad() {
+      if (vadEngine) { vadEngine.resetState(); return vadEngine; }
+      const ort = await import('onnxruntime-web');
+      // Absolute URL: ort resolves wasmPaths against its own module URL (a
+      // /node_modules path), not the document — only baseURI lands under the
+      // proxy prefix where public/vad/ort/ is actually served.
+      ort.env.wasm.wasmPaths = new URL('vad/ort/', document.baseURI).href;
+      // Single-threaded: multithreaded wasm needs SharedArrayBuffer, which
+      // requires cross-origin isolation the shell proxy doesn't provide.
+      ort.env.wasm.numThreads = 1;
+      const model = await (await fetch('vad/silero_vad_v5.onnx')).arrayBuffer();
+      const session = await ort.InferenceSession.create(model);
+      const sr = new ort.Tensor('int64', [16000n]);
+      let state = new ort.Tensor('float32', new Float32Array(2 * 128), [2, 1, 128]);
+      vadEngine = {
+        resetState() { state = new ort.Tensor('float32', new Float32Array(2 * 128), [2, 1, 128]); },
+        async prob(window512) {
+          const input = new ort.Tensor('float32', window512, [1, VAD_WINDOW]);
+          const out = await session.run({ input, state, sr });
+          state = out.stateN;
+          return out.output.data[0];
+        },
+      };
+      return vadEngine;
+    }
+
+    function resetVadCallState() {
+      vadSpeaking = false; vadStartRun = 0; vadSilenceMs = 0;
+      vadAccum = new Float32Array(0); preRoll.length = 0;
+      vadEngine?.resetState();
+    }
+
+    function sendFrame(buf) {
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send(buf);
+    }
+
+    function onVadProb(prob, windowMs) {
+      if (!vadSpeaking) {
+        vadStartRun = prob >= VAD_START_PROB ? vadStartRun + 1 : 0;
+        if (vadStartRun >= VAD_START_WINDOWS) {
+          vadSpeaking = true; vadSilenceMs = 0;
+          ws?.send(JSON.stringify({ type: 'vad', event: 'start' }));
+          for (const b of preRoll) sendFrame(b);   // don't clip the utterance onset
+          preRoll.length = 0;
+        }
+      } else if (prob < VAD_END_PROB) {
+        vadSilenceMs += windowMs;
+        const hangover = RESPONSIVENESS_MS[config.responsiveness] ?? RESPONSIVENESS_MS.balanced;
+        if (vadSilenceMs >= hangover) {
+          vadSpeaking = false; vadStartRun = 0; vadSilenceMs = 0;
+          ws?.send(JSON.stringify({ type: 'vad', event: 'end' }));
+        }
+      } else {
+        vadSilenceMs = 0;
+      }
+    }
+
+    function onMicFrame(buf) {
+      if (muted) return;
+      if (!vadActive) { sendFrame(buf); return; }   // server-VAD mode: stream continuously
+
+      // Browser-VAD mode: buffer while silent, stream while speaking.
+      if (vadSpeaking) sendFrame(buf);
+      else { preRoll.push(buf.slice(0)); if (preRoll.length > VAD_PREROLL_FRAMES) preRoll.shift(); }
+
+      // Feed the detector in 512-sample windows.
+      const i16 = new Int16Array(buf);
+      const merged = new Float32Array(vadAccum.length + i16.length);
+      merged.set(vadAccum, 0);
+      for (let k = 0; k < i16.length; k++) merged[vadAccum.length + k] = i16[k] / 0x8000;
+      vadAccum = merged;
+      if (vadAccum.length >= VAD_WINDOW && !vadBusy) {
+        const window512 = vadAccum.slice(0, VAD_WINDOW);
+        vadAccum = vadAccum.slice(VAD_WINDOW);
+        vadBusy = true;
+        vadEngine.prob(window512)
+          .then((p) => onVadProb(p, (VAD_WINDOW / 16000) * 1000))
+          .catch((err) => console.error('[callgemini] vad inference failed:', err))
+          .finally(() => { vadBusy = false; });
+      }
+    }
+
     async function startCapture() {
       captureStream = await navigator.mediaDevices.getUserMedia({
         audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
@@ -329,9 +452,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       await captureCtx.audioWorklet.addModule('worklets/capture-worklet.js');
       const source = captureCtx.createMediaStreamSource(captureStream);
       const node = new AudioWorkletNode(captureCtx, 'capture-worklet');
-      node.port.onmessage = (e) => {
-        if (!muted && ws && ws.readyState === WebSocket.OPEN) ws.send(e.data);
-      };
+      node.port.onmessage = (e) => onMicFrame(e.data);
       // A worklet is only pulled if it feeds a sink — route through a muted gain
       // so the mic never echoes to the speakers.
       const sink = captureCtx.createGain();
@@ -360,9 +481,26 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       updateControls();
       setStatus('connecting');
       try {
+        // VAD mode is fixed at connect time, so resolve it BEFORE the start
+        // frame: try to bring up the local engine, fall back to server VAD.
+        vadActive = false;
+        if ((config.vadMode ?? DEFAULTS.vadMode) === 'browser') {
+          try {
+            await initBrowserVad();
+            vadActive = true;
+          } catch (err) {
+            console.error('[callgemini] browser VAD init failed:', err);
+            systemLine('Browser VAD unavailable — using server voice detection for this call.', 'error');
+          }
+        }
+        resetVadCallState();
         ws = await openWs();
         // conversationId set → resume that conversation with its history as context.
-        ws.send(JSON.stringify({ type: 'start', config, conversationId: activeConversationId }));
+        ws.send(JSON.stringify({
+          type: 'start',
+          config: { ...config, vadMode: vadActive ? 'browser' : 'server' },
+          conversationId: activeConversationId,
+        }));
         await startPlayback();
         await startCapture();
         systemLine('Call started', 'info');
@@ -380,6 +518,8 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       try { ws?.close(); } catch { /* noop */ }
       ws = null;
       stopAudio();
+      vadActive = false;
+      resetVadCallState();
       finalizeTurn();
       toolChips.clear();
       setStatus('ended');
@@ -451,24 +591,32 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       })).filter((s) => s.url);
     }
 
-    function openSettings() {
-      els.fApiKey.value = config.apiKey ?? '';
-      els.fModel.value = config.model ?? DEFAULTS.model;
-      els.fSystem.value = config.systemInstruction ?? '';
-      els.fVoice.textContent = '';
-      for (const v of VOICES) {
-        const opt = document.createElement('option');
-        opt.value = v; opt.textContent = v;
-        if ((config.voiceName ?? DEFAULTS.voiceName) === v) opt.selected = true;
-        els.fVoice.appendChild(opt);
-      }
-      els.fResponsiveness.textContent = '';
-      for (const o of RESPONSIVENESS_OPTS) {
+    function fillSelect(sel, opts, selected) {
+      sel.textContent = '';
+      for (const o of opts) {
         const opt = document.createElement('option');
         opt.value = o.value; opt.textContent = o.label;
-        if ((config.responsiveness ?? DEFAULTS.responsiveness) === o.value) opt.selected = true;
-        els.fResponsiveness.appendChild(opt);
+        if (selected === o.value) opt.selected = true;
+        sel.appendChild(opt);
       }
+    }
+
+    function syncModelCustomVisibility() {
+      els.modelField.dataset.custom = String(els.fModelPreset.value === 'custom');
+    }
+
+    function openSettings() {
+      els.fApiKey.value = config.apiKey ?? '';
+      els.fSystem.value = config.systemInstruction ?? '';
+      // Model: select the matching preset, else Custom… with the raw id shown.
+      const modelId = config.model ?? DEFAULTS.model;
+      const preset = MODEL_PRESETS.find((p) => p.value === modelId) ? modelId : 'custom';
+      fillSelect(els.fModelPreset, MODEL_PRESETS, preset);
+      els.fModel.value = preset === 'custom' ? modelId : '';
+      syncModelCustomVisibility();
+      fillSelect(els.fVoice, VOICES.map((v) => ({ value: v, label: v })), config.voiceName ?? DEFAULTS.voiceName);
+      fillSelect(els.fVadMode, VAD_MODE_OPTS, config.vadMode ?? DEFAULTS.vadMode);
+      fillSelect(els.fResponsiveness, RESPONSIVENESS_OPTS, config.responsiveness ?? DEFAULTS.responsiveness);
       renderMcpRows();
       els.modal.dataset.open = 'true';
     }
@@ -478,11 +626,13 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     }
 
     function saveSettings() {
+      const preset = els.fModelPreset.value;
       config = {
         ...config,
         apiKey: els.fApiKey.value.trim(),
-        model: els.fModel.value.trim() || DEFAULTS.model,
+        model: (preset === 'custom' ? els.fModel.value.trim() : preset) || DEFAULTS.model,
         voiceName: els.fVoice.value || DEFAULTS.voiceName,
+        vadMode: els.fVadMode.value || DEFAULTS.vadMode,
         responsiveness: els.fResponsiveness.value || DEFAULTS.responsiveness,
         systemInstruction: els.fSystem.value.trim(),
         mcpServers: readMcpRows(),
@@ -639,6 +789,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     els.muteBtn?.addEventListener('click', toggleMute);
     els.settingsBtn?.addEventListener('click', openSettings);
     els.settingsSave?.addEventListener('click', saveSettings);
+    els.fModelPreset?.addEventListener('change', syncModelCustomVisibility);
     // Two elements carry data-action="settings-close" (the ✕ and the Cancel
     // button); querySelector would only bind the first. Delegate on the modal
     // so BOTH close it — and a click on the backdrop (outside the panel) too.
@@ -881,6 +1032,9 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     .field-label { font-size: 12px; font-weight: 600; color: var(--aura-color-text-dim); }
     .field-hint { font-size: 11px; color: var(--aura-color-text-dim); }
     textarea.field-input { resize: vertical; }
+    /* Custom model id input: only shown when the Model preset is "Custom…". */
+    .model-custom { display: none; }
+    .field[data-custom="true"] .model-custom { display: block; }
 
     .mcp-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 6px; }
     .mcp-row { display: flex; gap: 6px; align-items: center; }

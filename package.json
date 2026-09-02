@@ -13,9 +13,13 @@
     "@google/genai": "^2.19.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "astro": "^6.0.0",
+    "onnxruntime-web": "1.29.0",
     "ws": "^8.21.3"
   },
   "auraDependencies": {
     "@aura/app-sdk": "^0.0.1"
+  },
+  "devDependencies": {
+    "@ricky0123/vad-web": "0.0.30"
   }
 }
