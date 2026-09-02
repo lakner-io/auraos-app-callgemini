@@ -65,6 +65,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
           <button class="btn btn-icon" data-action="settings-close" type="button" aria-label="Close">✕</button>
         </div>
 
+        <div class="modal-body">
         <label class="field">
           <span class="field-label">Gemini API key</span>
           <input class="field-input" data-field="apiKey" type="password" placeholder={hasEnvKey ? 'Using GEMINI_API_KEY from Context — override here' : 'Paste your AI Studio key'} />
@@ -109,6 +110,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
           <div class="mcp-list" data-role="mcp-list"></div>
           <button class="btn btn-ghost btn-sm" data-action="mcp-add" type="button">+ Add MCP server</button>
         </div>
+        </div>
 
         <div class="modal-foot">
           <button class="btn btn-ghost" data-action="settings-close" type="button">Cancel</button>
@@ -141,8 +143,8 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       mcpServers: [],
     };
     const NOISE_OPTS = [
-      { value: 'ai', label: 'AI + browser (recommended)' },
-      { value: 'browser', label: 'Browser only' },
+      { value: 'ai', label: 'AI + Audio DSP (recommended)' },
+      { value: 'browser', label: 'Audio DSP only' },
     ];
     const RESPONSIVENESS_OPTS = [
       { value: 'snappy', label: 'Snappy · 350ms' },
@@ -1402,13 +1404,16 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     }
     .modal-overlay[data-open="true"] { display: flex; }
     .modal-panel {
-      width: 100%; max-width: 460px; max-height: 88vh; overflow-y: auto;
-      display: flex; flex-direction: column; gap: 14px;
+      width: 100%; max-width: 460px; max-height: 88vh; overflow: hidden;
+      display: flex; flex-direction: column;
       background: var(--aura-color-surface); color: var(--aura-color-text);
-      border: 1px solid var(--aura-color-border); border-radius: 14px; padding: 18px;
+      border: 1px solid var(--aura-color-border); border-radius: 14px;
     }
-    .modal-head, .modal-foot { display: flex; align-items: center; justify-content: space-between; }
-    .modal-foot { gap: 10px; }
+    /* Fixed header + footer, scrollable middle. */
+    .modal-head, .modal-foot { display: flex; align-items: center; justify-content: space-between; flex: 0 0 auto; }
+    .modal-head { padding: 16px 18px; border-bottom: 1px solid var(--aura-color-border); }
+    .modal-body { flex: 1 1 auto; overflow-y: auto; padding: 18px; display: flex; flex-direction: column; gap: 14px; }
+    .modal-foot { gap: 10px; padding: 14px 18px; border-top: 1px solid var(--aura-color-border); }
     .modal-foot .call-btn { flex: 0 0 auto; }
     .modal-title { margin: 0; font-size: 16px; }
 
