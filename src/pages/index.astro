@@ -32,7 +32,10 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
           <span>CallGemini</span>
         </div>
       </div>
-      <span class="status-pill" data-role="status" data-state="idle">Idle</span>
+      <div class="cg-header-right">
+        <span class="status-pill vad-pill" data-role="vad-badge" data-kind="none"></span>
+        <span class="status-pill" data-role="status" data-state="idle">Idle</span>
+      </div>
     </header>
 
     <main class="cg-transcript" data-role="transcript">
@@ -157,6 +160,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       toggleSidebarBtn: $('[data-action="toggle-sidebar"]'),
       newChatBtn: $('[data-action="new-chat"]'),
       status: $('[data-role="status"]'),
+      vadBadge: $('[data-role="vad-badge"]'),
       transcript: $('[data-role="transcript"]'),
       callBtn: $('[data-action="toggle-call"]'),
       muteBtn: $('[data-action="mute"]'),
@@ -226,6 +230,15 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
         els.status.dataset.state = state;
         els.status.textContent = message ? `${STATUS_LABEL[state] ?? state} · ${message}` : (STATUS_LABEL[state] ?? state);
       }
+    }
+
+    const VAD_BADGE_LABEL = { silero: 'Silero VAD', energy: 'Energy VAD', server: 'Server VAD' };
+    /** Reflect the engine ACTUALLY in use this call (post-fallback), not the
+     * Settings choice. `null` hides the badge (no call running). */
+    function setVadBadge(kind) {
+      if (!els.vadBadge) return;
+      els.vadBadge.dataset.kind = kind ?? 'none';
+      els.vadBadge.textContent = kind ? VAD_BADGE_LABEL[kind] : '';
     }
 
     function scrollDown() {
@@ -355,56 +368,134 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     const VAD_START_PROB = 0.5;
     const VAD_END_PROB = 0.35;
     const VAD_START_WINDOWS = 2;            // consecutive windows to commit speech-start
+    // Echo-guard thresholds while Gemini's audio is audible: speaker bleed must
+    // not pass, a real interjection must. (~6 windows ≈ 200 ms of strong speech.)
+    const VAD_BARGE_PROB = 0.75;
+    const VAD_BARGE_WINDOWS = 6;
     const VAD_PREROLL_FRAMES = 15;          // ~300 ms of 20 ms frames sent on speech-start
-    let vadEngine = null;                   // cached across calls
-    let vadActive = false;                  // this call runs browser VAD
+    let vadEngine = null;                   // cached across calls (silero or energy)
+    let vadEngineKind = null;               // 'silero' | 'energy' | null (null = server VAD)
     let vadSpeaking = false;
     let vadStartRun = 0;
     let vadSilenceMs = 0;
     let vadAccum = new Float32Array(0);     // pending samples until a 512 window fills
     let vadBusy = false;
-    const preRoll = [];                     // recent ArrayBuffers while silent
+    const preRoll = [];                     // recent ArrayBuffers while silent/gated
+    let modelSpeaking = false;              // playback worklet says audio is audible
+    let serverBarge = false;                // server-VAD mode: user broke through the gate
+    let serverBargeRun = 0;
+    let energyGuard = null;                 // energy detector for server-mode echo guard
 
-    async function initBrowserVad() {
-      if (vadEngine) { vadEngine.resetState(); return vadEngine; }
-      const ort = await import('onnxruntime-web');
-      // Absolute URL: ort resolves wasmPaths against its own module URL (a
-      // /node_modules path), not the document — only baseURI lands under the
-      // proxy prefix where public/vad/ort/ is actually served.
-      ort.env.wasm.wasmPaths = new URL('vad/ort/', document.baseURI).href;
-      // Single-threaded: multithreaded wasm needs SharedArrayBuffer, which
-      // requires cross-origin isolation the shell proxy doesn't provide.
-      ort.env.wasm.numThreads = 1;
-      const model = await (await fetch('vad/silero_vad_v5.onnx')).arrayBuffer();
-      const session = await ort.InferenceSession.create(model);
-      const sr = new ort.Tensor('int64', [16000n]);
-      let state = new ort.Tensor('float32', new Float32Array(2 * 128), [2, 1, 128]);
-      vadEngine = {
-        resetState() { state = new ort.Tensor('float32', new Float32Array(2 * 128), [2, 1, 128]); },
+    // wasm SIMD feature probe (ort 1.29 ships ONLY the SIMD build and hard-throws
+    // without it — the known Android-WebView failure). Standard detect bytes.
+    const SIMD_TEST = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 123,
+      3, 2, 1, 0, 10, 10, 1, 8, 0, 65, 0, 253, 15, 253, 98, 11]);
+
+    /** RMS vs. adaptive-noise-floor detector — the no-wasm fallback tier. Less
+     * accurate than Silero in noise, but runs on ANY WebView and is plenty to
+     * drive activity signals + the echo guard. Maps to pseudo-probs matching
+     * the shared thresholds above. */
+    function createEnergyVad() {
+      let floor = 0.01;
+      return {
+        kind: 'energy',
+        resetState() { floor = 0.01; },
         async prob(window512) {
-          const input = new ort.Tensor('float32', window512, [1, VAD_WINDOW]);
-          const out = await session.run({ input, state, sr });
-          state = out.stateN;
-          return out.output.data[0];
+          let sum = 0;
+          for (let i = 0; i < window512.length; i++) sum += window512[i] * window512[i];
+          const rms = Math.sqrt(sum / window512.length);
+          // Fast decay toward quieter, very slow rise — tracks room noise.
+          floor = rms < floor ? floor * 0.7 + rms * 0.3 : floor * 0.999 + rms * 0.001;
+          if (floor < 1e-4) floor = 1e-4;
+          if (rms > floor * 5) return 0.9;
+          if (rms > floor * 3) return 0.6;
+          return 0.1;
         },
       };
-      return vadEngine;
+    }
+
+    /**
+     * Bring up the best available local VAD: Silero (wasm) → energy fallback.
+     * Never throws — worst case is the dependency-free energy tier. Each Silero
+     * stage is labelled so a device failure (e.g. Android WebView without wasm
+     * SIMD) reports exactly WHY instead of a blind generic message.
+     */
+    async function initBrowserVad() {
+      if (vadEngine) { vadEngine.resetState(); return vadEngine; }
+      let stage = 'wasm SIMD check';
+      try {
+        if (typeof WebAssembly === 'undefined' || !WebAssembly.validate(SIMD_TEST)) {
+          throw new Error('this WebView has no WebAssembly SIMD support');
+        }
+        stage = 'load onnxruntime';
+        const ort = await import('onnxruntime-web');
+        ort.env.wasm.numThreads = 1; // no SharedArrayBuffer without cross-origin isolation
+        // Explicit absolute mjs URL + prefetched wasm binary: sidesteps the two
+        // other WebView failure modes (loader path resolution relative to the
+        // ort module, and wasm MIME/streaming-compile strictness).
+        ort.env.wasm.wasmPaths = { mjs: new URL('vad/ort/ort-wasm-simd-threaded.mjs', document.baseURI).href };
+        stage = 'fetch wasm runtime';
+        const wasmRes = await fetch('vad/ort/ort-wasm-simd-threaded.wasm');
+        if (!wasmRes.ok) throw new Error(`HTTP ${wasmRes.status}`);
+        ort.env.wasm.wasmBinary = await wasmRes.arrayBuffer();
+        stage = 'fetch silero model';
+        const modelRes = await fetch('vad/silero_vad_v5.onnx');
+        if (!modelRes.ok) throw new Error(`HTTP ${modelRes.status}`);
+        const model = await modelRes.arrayBuffer();
+        stage = 'create session';
+        const session = await ort.InferenceSession.create(model);
+        const sr = new ort.Tensor('int64', [16000n]);
+        let state = new ort.Tensor('float32', new Float32Array(2 * 128), [2, 1, 128]);
+        vadEngine = {
+          kind: 'silero',
+          resetState() { state = new ort.Tensor('float32', new Float32Array(2 * 128), [2, 1, 128]); },
+          async prob(window512) {
+            const input = new ort.Tensor('float32', window512, [1, VAD_WINDOW]);
+            const out = await session.run({ input, state, sr });
+            state = out.stateN;
+            return out.output.data[0];
+          },
+        };
+        return vadEngine;
+      } catch (err) {
+        console.error(`[callgemini] Silero VAD init failed at "${stage}":`, err);
+        systemLine(`Silero VAD unavailable (${stage}: ${err?.message ?? err}) — using energy-based detection.`, 'info');
+        vadEngine = createEnergyVad();
+        return vadEngine;
+      }
     }
 
     function resetVadCallState() {
       vadSpeaking = false; vadStartRun = 0; vadSilenceMs = 0;
       vadAccum = new Float32Array(0); preRoll.length = 0;
+      serverBarge = false; serverBargeRun = 0; modelSpeaking = false;
       vadEngine?.resetState();
+      energyGuard?.resetState();
     }
 
     function sendFrame(buf) {
       if (ws && ws.readyState === WebSocket.OPEN) ws.send(buf);
     }
 
+    function bufferPreRoll(buf) {
+      preRoll.push(buf.slice(0));
+      if (preRoll.length > VAD_PREROLL_FRAMES) preRoll.shift();
+    }
+
+    function flushPreRoll() {
+      for (const b of preRoll) sendFrame(b);   // don't clip the utterance onset
+      preRoll.length = 0;
+    }
+
     function onVadProb(prob, windowMs) {
       if (!vadSpeaking) {
-        vadStartRun = prob >= VAD_START_PROB ? vadStartRun + 1 : 0;
-        if (vadStartRun >= VAD_START_WINDOWS) {
+        // Echo guard: while Gemini's audio is audible the bar is higher, so
+        // speaker bleed into the mic can't trigger us — a real interjection
+        // (louder, sustained) still does.
+        const startProb = modelSpeaking ? VAD_BARGE_PROB : VAD_START_PROB;
+        const startWindows = modelSpeaking ? VAD_BARGE_WINDOWS : VAD_START_WINDOWS;
+        vadStartRun = prob >= startProb ? vadStartRun + 1 : 0;
+        if (vadStartRun >= startWindows) {
           vadSpeaking = true; vadSilenceMs = 0;
           // Instant local barge-in: silence Gemini the moment the user speaks
           // instead of waiting for the server's `interrupted` round-trip. The
@@ -412,8 +503,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
           // default is START_OF_ACTIVITY_INTERRUPTS).
           playbackNode?.port.postMessage('clear');
           ws?.send(JSON.stringify({ type: 'vad', event: 'start' }));
-          for (const b of preRoll) sendFrame(b);   // don't clip the utterance onset
-          preRoll.length = 0;
+          flushPreRoll();
         }
       } else if (prob < VAD_END_PROB) {
         vadSilenceMs += windowMs;
@@ -427,15 +517,20 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       }
     }
 
-    function onMicFrame(buf) {
-      if (muted) return;
-      if (!vadActive) { sendFrame(buf); return; }   // server-VAD mode: stream continuously
+    /** Server-VAD mode echo guard: while Gemini audio is audible the mic is
+     * gated (Gemini must not hear itself), and this local energy detector
+     * decides when the user genuinely talks over it — then we flush the
+     * pre-roll and resume streaming so Gemini's own VAD sees the barge-in. */
+    function onServerGuardProb(prob) {
+      serverBargeRun = prob >= VAD_BARGE_PROB ? serverBargeRun + 1 : 0;
+      if (serverBargeRun >= VAD_BARGE_WINDOWS) {
+        serverBarge = true;
+        flushPreRoll();
+      }
+    }
 
-      // Browser-VAD mode: buffer while silent, stream while speaking.
-      if (vadSpeaking) sendFrame(buf);
-      else { preRoll.push(buf.slice(0)); if (preRoll.length > VAD_PREROLL_FRAMES) preRoll.shift(); }
-
-      // Feed the detector in 512-sample windows.
+    /** Chunk mic audio into 512-sample windows for whichever detector is on. */
+    function feedDetector(buf, engine, onProb) {
       const i16 = new Int16Array(buf);
       const merged = new Float32Array(vadAccum.length + i16.length);
       merged.set(vadAccum, 0);
@@ -445,11 +540,35 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
         const window512 = vadAccum.slice(0, VAD_WINDOW);
         vadAccum = vadAccum.slice(VAD_WINDOW);
         vadBusy = true;
-        vadEngine.prob(window512)
-          .then((p) => onVadProb(p, (VAD_WINDOW / 16000) * 1000))
+        engine.prob(window512)
+          .then((p) => onProb(p, (VAD_WINDOW / 16000) * 1000))
           .catch((err) => console.error('[callgemini] vad inference failed:', err))
           .finally(() => { vadBusy = false; });
       }
+    }
+
+    function onMicFrame(buf) {
+      if (muted) return;
+
+      if (vadEngineKind === null) {
+        // Server-VAD mode. Normally stream continuously — but while Gemini's
+        // audio is audible, gate the mic so it can't hear itself. The energy
+        // detector opens the gate when the user genuinely barges in.
+        if (modelSpeaking && !serverBarge) {
+          bufferPreRoll(buf);
+          if (!energyGuard) energyGuard = createEnergyVad();
+          feedDetector(buf, energyGuard, onServerGuardProb);
+          return;
+        }
+        sendFrame(buf);
+        return;
+      }
+
+      // Browser-VAD mode (silero or energy): buffer while silent, stream while
+      // speaking, and let the detector drive the activity signals.
+      if (vadSpeaking) sendFrame(buf);
+      else bufferPreRoll(buf);
+      feedDetector(buf, vadEngine, onVadProb);
     }
 
     async function startCapture() {
@@ -468,16 +587,42 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       source.connect(node).connect(sink).connect(captureCtx.destination);
     }
 
+    /** Android WebView (Capacitor et al.): UA carries "; wv)" on modern builds
+     * or the legacy "Version/x.y" token alongside Chrome. */
+    function isAndroidWebView() {
+      const ua = navigator.userAgent;
+      return ua.includes('; wv)') || (/Android/.test(ua) && /Version\/[\d.]+/.test(ua));
+    }
+
     async function startPlayback() {
       playbackCtx = new AudioContext({ sampleRate: 24000 });
       await playbackCtx.audioWorklet.addModule('worklets/playback-worklet.js');
       playbackNode = new AudioWorkletNode(playbackCtx, 'playback-worklet');
-      // Route through a MediaStream → hidden <audio> element instead of
-      // ctx.destination ON PURPOSE: the browser's echo canceller only
+      // The worklet reports exactly when model audio is audible — this drives
+      // the software echo guard (stricter barge-in / server-mode mic gating).
+      playbackNode.port.onmessage = (e) => {
+        if (e.data === 'playing') { modelSpeaking = true; return; }
+        if (e.data === 'idle') {
+          modelSpeaking = false;
+          serverBarge = false; serverBargeRun = 0;
+          // Gate-buffered frames are stale once Gemini stops talking.
+          if (!vadSpeaking) preRoll.length = 0;
+        }
+      };
+      if (isAndroidWebView()) {
+        // WebView: the echoCancellation constraint usually isn't backed by a
+        // real canceller, and media-element output plays on the (louder) media
+        // audio path — the element route is pure downside there. Use the
+        // direct route; the software echo guard handles the bleed.
+        playbackNode.connect(playbackCtx.destination);
+        return;
+      }
+      // Desktop: route through a MediaStream → hidden <audio> element instead
+      // of ctx.destination ON PURPOSE — the browser's echo canceller only
       // subtracts playback it can "see" (WebRTC / media elements), not raw
       // AudioContext output. Without this, speakers-without-headphones feed
-      // Gemini's voice back into the mic and the VAD triggers on it (Gemini
-      // interrupts itself). Costs a few ms of element buffering — worth it.
+      // Gemini's voice back into the mic and the VAD triggers on it. Costs a
+      // few ms of element buffering — worth it.
       const dest = playbackCtx.createMediaStreamDestination();
       playbackNode.connect(dest);
       playbackEl = new Audio();
@@ -511,23 +656,27 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       setStatus('connecting');
       try {
         // VAD mode is fixed at connect time, so resolve it BEFORE the start
-        // frame: try to bring up the local engine, fall back to server VAD.
-        vadActive = false;
+        // frame. initBrowserVad never throws — it degrades Silero → energy
+        // internally (and reports the exact failing stage). Server VAD only if
+        // even that dies, which would be a bug worth seeing loudly.
+        vadEngineKind = null;
         if ((config.vadMode ?? DEFAULTS.vadMode) === 'browser') {
           try {
-            await initBrowserVad();
-            vadActive = true;
+            const engine = await initBrowserVad();
+            vadEngineKind = engine.kind;
+            systemLine(engine.kind === 'silero' ? 'Browser VAD: Silero' : 'Browser VAD: energy fallback', 'info');
           } catch (err) {
             console.error('[callgemini] browser VAD init failed:', err);
-            systemLine('Browser VAD unavailable — using server voice detection for this call.', 'error');
+            systemLine(`Browser VAD unavailable (${err?.message ?? err}) — using server voice detection.`, 'error');
           }
         }
         resetVadCallState();
+        setVadBadge(vadEngineKind ?? 'server');   // what's REALLY driving this call
         ws = await openWs();
         // conversationId set → resume that conversation with its history as context.
         ws.send(JSON.stringify({
           type: 'start',
-          config: { ...config, vadMode: vadActive ? 'browser' : 'server' },
+          config: { ...config, vadMode: vadEngineKind ? 'browser' : 'server' },
           conversationId: activeConversationId,
         }));
         await startPlayback();
@@ -547,7 +696,8 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       try { ws?.close(); } catch { /* noop */ }
       ws = null;
       stopAudio();
-      vadActive = false;
+      vadEngineKind = null;
+      setVadBadge(null);
       resetVadCallState();
       finalizeTurn();
       toolChips.clear();
@@ -974,6 +1124,12 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     .status-pill[data-state="live"] { background: var(--aura-color-success); color: var(--aura-color-bg); border-color: transparent; }
     .status-pill[data-state="connecting"] { background: var(--aura-color-info); color: var(--aura-color-bg); border-color: transparent; }
     .status-pill[data-state="error"] { background: var(--aura-color-danger); color: var(--aura-color-bg); border-color: transparent; }
+
+    .cg-header-right { display: flex; align-items: center; gap: 6px; }
+    /* Which speech detector is ACTUALLY driving the current call. */
+    .vad-pill[data-kind="none"] { display: none; }
+    .vad-pill[data-kind="silero"] { border-color: var(--aura-color-primary); color: var(--aura-color-primary); }
+    .vad-pill[data-kind="energy"] { border-color: var(--aura-color-warning); color: var(--aura-color-warning); }
 
     .cg-transcript {
       flex: 1; overflow-y: auto;

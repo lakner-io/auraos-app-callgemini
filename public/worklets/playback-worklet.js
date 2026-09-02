@@ -14,6 +14,10 @@
  *   • 'clear'      — flush the queue immediately (barge-in / interruption).
  *   • 'flush'      — play out whatever is queued now (end of a model turn,
  *                    where the final burst may be smaller than the cushion).
+ * Messages to the main thread:
+ *   • 'playing' / 'idle' — posted on transitions so the controller knows
+ *     EXACTLY when model audio is audible (drives the software echo guard:
+ *     stricter barge-in / mic gating while Gemini is speaking).
  */
 const PRIME_SAMPLES = 1920;   // ~80 ms @ 24 kHz
 const STALL_BLOCKS = 30;      // failsafe: force-start after ~160 ms of waiting
@@ -27,6 +31,7 @@ class PlaybackProcessor extends AudioWorkletProcessor {
     this.curPos = 0;
     this.primed = false;  // burst gate: wait for the cushion before starting
     this.stall = 0;       // blocks spent waiting while audio is queued
+    this.playing = false; // audible right now — transitions posted to main
     this.port.onmessage = (e) => {
       if (e.data === 'clear') {
         this.queue = [];
@@ -35,6 +40,7 @@ class PlaybackProcessor extends AudioWorkletProcessor {
         this.curPos = 0;
         this.primed = false;
         this.stall = 0;
+        this.setPlaying(false);
         return;
       }
       if (e.data === 'flush') {
@@ -48,6 +54,12 @@ class PlaybackProcessor extends AudioWorkletProcessor {
       this.queued += f.length;
       if (this.queued >= PRIME_SAMPLES) this.primed = true;
     };
+  }
+
+  setPlaying(v) {
+    if (this.playing === v) return;
+    this.playing = v;
+    this.port.postMessage(v ? 'playing' : 'idle');
   }
 
   process(_inputs, outputs) {
@@ -75,6 +87,7 @@ class PlaybackProcessor extends AudioWorkletProcessor {
       }
       out[n] = this.cur ? this.cur[this.curPos++] : 0;
     }
+    this.setPlaying(this.cur !== null);
     return true;
   }
 }
