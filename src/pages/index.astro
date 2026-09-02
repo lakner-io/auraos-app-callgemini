@@ -188,6 +188,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     let captureStream = null;
     let playbackCtx = null;
     let playbackNode = null;
+    let playbackEl = null;   // hidden <audio> sink — see startPlayback (AEC)
     const activeBubbles = { user: null, model: null };
     const toolChips = new Map();
 
@@ -471,14 +472,35 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       playbackCtx = new AudioContext({ sampleRate: 24000 });
       await playbackCtx.audioWorklet.addModule('worklets/playback-worklet.js');
       playbackNode = new AudioWorkletNode(playbackCtx, 'playback-worklet');
-      playbackNode.connect(playbackCtx.destination);
+      // Route through a MediaStream → hidden <audio> element instead of
+      // ctx.destination ON PURPOSE: the browser's echo canceller only
+      // subtracts playback it can "see" (WebRTC / media elements), not raw
+      // AudioContext output. Without this, speakers-without-headphones feed
+      // Gemini's voice back into the mic and the VAD triggers on it (Gemini
+      // interrupts itself). Costs a few ms of element buffering — worth it.
+      const dest = playbackCtx.createMediaStreamDestination();
+      playbackNode.connect(dest);
+      playbackEl = new Audio();
+      playbackEl.srcObject = dest.stream;
+      try {
+        await playbackEl.play();
+      } catch (err) {
+        // Autoplay-policy edge case: never let audio silently break just to
+        // gain AEC — fall back to the direct (non-AEC) route.
+        console.error('[callgemini] media-element playback blocked, falling back:', err);
+        playbackEl.srcObject = null;
+        playbackEl = null;
+        playbackNode.disconnect(dest);
+        playbackNode.connect(playbackCtx.destination);
+      }
     }
 
     function stopAudio() {
       try { captureStream?.getTracks().forEach((t) => t.stop()); } catch { /* noop */ }
       try { captureCtx?.close(); } catch { /* noop */ }
       try { playbackCtx?.close(); } catch { /* noop */ }
-      captureStream = null; captureCtx = null; playbackCtx = null; playbackNode = null;
+      try { playbackEl?.pause(); if (playbackEl) playbackEl.srcObject = null; } catch { /* noop */ }
+      captureStream = null; captureCtx = null; playbackCtx = null; playbackNode = null; playbackEl = null;
     }
 
     async function startCall() {
