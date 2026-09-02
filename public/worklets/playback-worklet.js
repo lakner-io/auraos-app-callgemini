@@ -18,6 +18,9 @@
  *   • 'playing' / 'idle' — posted on transitions so the controller knows
  *     EXACTLY when model audio is audible (drives the software echo guard:
  *     stricter barge-in / mic gating while Gemini is speaking).
+ *   • { t:'level', v } — RMS of the samples actually rendered, every 8 blocks
+ *     (~43 ms) while playing (one final 0 on idle). Drives the call button's
+ *     audio-reactive glow; throttled so it stays cheap.
  */
 const PRIME_SAMPLES = 1920;   // ~80 ms @ 24 kHz
 const STALL_BLOCKS = 30;      // failsafe: force-start after ~160 ms of waiting
@@ -32,6 +35,9 @@ class PlaybackProcessor extends AudioWorkletProcessor {
     this.primed = false;  // burst gate: wait for the cushion before starting
     this.stall = 0;       // blocks spent waiting while audio is queued
     this.playing = false; // audible right now — transitions posted to main
+    this.lvlSum = 0;      // level accumulator (sum of squares / sample count)
+    this.lvlN = 0;
+    this.lvlBlocks = 0;
     this.port.onmessage = (e) => {
       if (e.data === 'clear') {
         this.queue = [];
@@ -60,6 +66,7 @@ class PlaybackProcessor extends AudioWorkletProcessor {
     if (this.playing === v) return;
     this.playing = v;
     this.port.postMessage(v ? 'playing' : 'idle');
+    if (!v) { this.port.postMessage({ t: 'level', v: 0 }); this.lvlSum = 0; this.lvlN = 0; this.lvlBlocks = 0; }
   }
 
   process(_inputs, outputs) {
@@ -85,9 +92,17 @@ class PlaybackProcessor extends AudioWorkletProcessor {
           if (this.queue.length === 0) this.primed = false;
         }
       }
-      out[n] = this.cur ? this.cur[this.curPos++] : 0;
+      const s = this.cur ? this.cur[this.curPos++] : 0;
+      out[n] = s;
+      this.lvlSum = (this.lvlSum ?? 0) + s * s;
     }
+    this.lvlN = (this.lvlN ?? 0) + out.length;
     this.setPlaying(this.cur !== null);
+    // Throttled level report (~43 ms) while audible — drives the button glow.
+    if (this.playing && ++this.lvlBlocks >= 8) {
+      this.port.postMessage({ t: 'level', v: Math.sqrt(this.lvlSum / this.lvlN) });
+      this.lvlSum = 0; this.lvlN = 0; this.lvlBlocks = 0;
+    }
     return true;
   }
 }

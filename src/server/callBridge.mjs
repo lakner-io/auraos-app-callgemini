@@ -18,6 +18,8 @@
  *   { type:'status', state }   { type:'transcript', role, text }
  *   { type:'tool', name, phase }   { type:'interrupted' }   { type:'turnComplete' }
  *   { type:'conversation', id, title }   (the conversation being recorded / its title)
+ * status.state includes 'reconnecting' while a dropped Gemini socket is being
+ * resumed via a Live API session-resumption handle (state preserved server-side).
  */
 
 import { WebSocketServer } from 'ws';
@@ -66,6 +68,9 @@ export class CallSession {
     this.closed = false;
     this.convId = null;                       // conversation being recorded
     this.accrual = { role: null, text: '' };  // in-progress turn (chunks accumulate)
+    this.resumeHandle = null;                 // Live API session-resumption token
+    this.reconnectTries = 0;
+    this.userStopped = false;                 // stop was intentional — don't auto-resume
     register(this);
 
     ws.on('message', (data, isBinary) => this.onClientMessage(data, isBinary));
@@ -191,31 +196,25 @@ export class CallSession {
       // the API errors if set on a model without thinking support (and
       // live.connect below retries once without it if the guard guessed wrong).
       ...(model.includes('native-audio') ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
+      // Ask the server for resumption handles so a dropped Gemini socket can
+      // be reconnected with state intact (see onclose / sessionResumptionUpdate).
+      sessionResumption: {},
       ...(decls.length ? { tools: [{ functionDeclarations: decls }] } : {}),
     };
 
     try {
-      const genai = new GoogleGenAI({ apiKey, httpOptions: { apiVersion: 'v1beta' } });
-      const callbacks = {
-        onopen: () => this.emit({ type: 'status', state: 'live' }),
-        onmessage: (message) => this.onServerMessage(message),
-        onerror: (e) => this.emit({ type: 'status', state: 'error', message: e?.message ?? 'Gemini stream error' }),
-        onclose: () => { if (!this.closed) this.emit({ type: 'status', state: 'ended' }); },
-      };
-      try {
-        this.session = await genai.live.connect({ model, callbacks, config: liveConfig });
-      } catch (err) {
-        // The thinking guard keys off the model id; if this id doesn't actually
-        // support thinking the API rejects the config — retry once without it.
-        if (!liveConfig.thinkingConfig) throw err;
-        console.error('[callgemini] connect with thinkingConfig failed, retrying without:', err?.message ?? err);
-        const { thinkingConfig, ...rest } = liveConfig;
-        this.session = await genai.live.connect({ model, callbacks, config: rest });
-      }
+      this.genai = new GoogleGenAI({ apiKey, httpOptions: { apiVersion: 'v1beta' } });
+      this.model = model;
+      this.liveConfig = liveConfig;
+      this.userStopped = false;
+      this.reconnectTries = 0;
+      this.resumeHandle = null;
+      await this.connectGemini();
 
-      // Resume: replay prior turns as context WITHOUT eliciting a reply
-      // (turnComplete:false) so Gemini continues where the conversation left off
-      // once the user speaks.
+      // Resume a SAVED conversation: replay prior turns as context WITHOUT
+      // eliciting a reply (turnComplete:false) so Gemini continues where it
+      // left off once the user speaks. (Live-session RECONNECTS don't re-seed —
+      // the resumption handle already carries the state.)
       if (priorTurns.length) {
         try {
           this.session.sendClientContent({
@@ -234,7 +233,58 @@ export class CallSession {
     }
   }
 
+  /** Dial (or re-dial) the Gemini Live socket. With a resumption handle the
+   * server restores the previous session's state — mid-call network drops
+   * become a brief "reconnecting" instead of a dead call. */
+  async connectGemini(resumeHandle) {
+    const config = resumeHandle
+      ? { ...this.liveConfig, sessionResumption: { handle: resumeHandle } }
+      : this.liveConfig;
+    const callbacks = {
+      onopen: () => { this.reconnectTries = 0; this.emit({ type: 'status', state: 'live' }); },
+      onmessage: (message) => this.onServerMessage(message),
+      onerror: (e) => this.emit({ type: 'status', state: 'error', message: e?.message ?? 'Gemini stream error' }),
+      onclose: () => this.onGeminiClose(),
+    };
+    try {
+      this.session = await this.genai.live.connect({ model: this.model, callbacks, config });
+    } catch (err) {
+      // The thinking guard keys off the model id; if this id doesn't actually
+      // support thinking the API rejects the config — retry once without it.
+      if (!config.thinkingConfig) throw err;
+      console.error('[callgemini] connect with thinkingConfig failed, retrying without:', err?.message ?? err);
+      const { thinkingConfig, ...rest } = config;
+      this.session = await this.genai.live.connect({ model: this.model, callbacks, config: rest });
+    }
+  }
+
+  /** Gemini socket closed. Intentional (user stop / teardown) → today's clean
+   * end. Unexpected + we hold a resumption handle → bounded auto-resume. */
+  onGeminiClose() {
+    this.session = null;
+    if (this.closed || this.userStopped) return;
+    if (this.resumeHandle && this.reconnectTries < 2) {
+      this.reconnectTries += 1;
+      this.emit({ type: 'status', state: 'reconnecting' });
+      console.log(`[callgemini] Gemini socket dropped — resuming (try ${this.reconnectTries})`);
+      this.connectGemini(this.resumeHandle).catch((err) => {
+        console.error('[callgemini] session resume failed:', err?.message ?? err);
+        this.emit({ type: 'status', state: 'ended' });
+      });
+      return;
+    }
+    this.emit({ type: 'status', state: 'ended' });
+  }
+
   onServerMessage(message) {
+    // Track the latest resumable state token; goAway means the server is about
+    // to drop us — the subsequent onclose auto-resumes with this handle.
+    const sru = message?.sessionResumptionUpdate;
+    if (sru?.resumable && sru.newHandle) this.resumeHandle = sru.newHandle;
+    if (message?.goAway) {
+      console.log('[callgemini] Gemini goAway received (timeLeft:', message.goAway.timeLeft ?? '?', ') — will auto-resume');
+    }
+
     const sc = message?.serverContent;
     if (sc?.inputTranscription?.text) {
       this.emit({ type: 'transcript', role: 'user', text: sc.inputTranscription.text });
@@ -314,6 +364,7 @@ export class CallSession {
 
   /** End the Gemini side of the call but keep the WS open for a new call. */
   stopGemini(_reason) {
+    this.userStopped = true; // intentional — onGeminiClose must not auto-resume
     this.flushTurn(); // persist any in-progress turn before tearing down
     try { this.session?.close?.(); } catch { /* noop */ }
     this.session = null;

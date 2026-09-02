@@ -192,7 +192,14 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     let captureStream = null;
     let playbackCtx = null;
     let playbackNode = null;
+    let playbackGain = null; // fade stage for soft barge-in
     let playbackEl = null;   // hidden <audio> sink — see startPlayback (AEC)
+    let fading = false;      // softInterrupt re-entrancy guard
+    let userLevel = 0;       // live RMS of mic / model audio → button glow
+    let modelLevel = 0;
+    let levelRaf = 0;
+    let smoothedLevel = 0;
+    let wsReconnecting = false; // browser-leg auto-reconnect in progress
     const activeBubbles = { user: null, model: null };
     const toolChips = new Map();
 
@@ -223,6 +230,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
 
     const STATUS_LABEL = {
       idle: 'Idle', connecting: 'Connecting…', live: 'Live', ended: 'Call ended', error: 'Error',
+      reconnecting: 'Reconnecting…',
     };
 
     function setStatus(state, message) {
@@ -316,8 +324,46 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
         sock.addEventListener('open', () => resolve(sock));
         sock.addEventListener('error', (e) => reject(e));
         sock.addEventListener('message', onWsMessage);
-        sock.addEventListener('close', () => { if (inCall) endCall('socket-closed'); });
+        // A close while a call is live and no reconnect is already running is
+        // a network drop, not a hang-up (endCall flips inCall to false BEFORE
+        // its socket close fires) — try to resume instead of dying.
+        sock.addEventListener('close', () => {
+          if (!inCall || wsReconnecting) return;
+          reconnectWs();
+        });
       });
+    }
+
+    function buildStartFrame() {
+      return JSON.stringify({
+        type: 'start',
+        config: { ...config, vadMode: vadEngineKind ? 'browser' : 'server' },
+        conversationId: activeConversationId,
+      });
+    }
+
+    /**
+     * Browser-leg resilience: the audio pipeline stays alive; we re-dial the
+     * app WS with backoff and re-`start` with the SAME conversationId — the
+     * server re-seeds Gemini from the saved transcript (the existing resume
+     * path), so the call continues instead of starting over.
+     */
+    async function reconnectWs() {
+      wsReconnecting = true;
+      setStatus('reconnecting');
+      for (const delay of [500, 1000, 2000]) {
+        await new Promise((r) => setTimeout(r, delay));
+        if (!inCall) { wsReconnecting = false; return; }  // user hung up meanwhile
+        try {
+          ws = await openWs();
+          ws.send(buildStartFrame());
+          wsReconnecting = false;
+          return; // server takes it from here (connecting → live events follow)
+        } catch { /* next backoff step */ }
+      }
+      wsReconnecting = false;
+      systemLine('Connection lost — could not reconnect.', 'error');
+      endCall('reconnect-failed');
     }
 
     function onWsMessage(ev) {
@@ -341,7 +387,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
           if (playbackNode) playbackNode.port.postMessage('flush');
           break;
         case 'interrupted':
-          if (playbackNode) playbackNode.port.postMessage('clear');
+          softInterrupt();
           break;
         case 'tool':
           toolChip(msg.name, msg.phase, msg.error);
@@ -497,11 +543,11 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
         vadStartRun = prob >= startProb ? vadStartRun + 1 : 0;
         if (vadStartRun >= startWindows) {
           vadSpeaking = true; vadSilenceMs = 0;
-          // Instant local barge-in: silence Gemini the moment the user speaks
+          // Instant local barge-in: fade Gemini out the moment the user speaks
           // instead of waiting for the server's `interrupted` round-trip. The
           // activityStart below is the server-side interrupt (the Live API
           // default is START_OF_ACTIVITY_INTERRUPTS).
-          playbackNode?.port.postMessage('clear');
+          softInterrupt();
           ws?.send(JSON.stringify({ type: 'vad', event: 'start' }));
           flushPreRoll();
         }
@@ -548,7 +594,15 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     }
 
     function onMicFrame(buf) {
-      if (muted) return;
+      if (muted) { userLevel = 0; return; }
+
+      // Cheap strided RMS for the button glow (every 4th sample of 20 ms).
+      {
+        const i16 = new Int16Array(buf);
+        let sum = 0, n = 0;
+        for (let k = 0; k < i16.length; k += 4) { const s = i16[k] / 0x8000; sum += s * s; n++; }
+        userLevel = Math.sqrt(sum / (n || 1));
+      }
 
       if (vadEngineKind === null) {
         // Server-VAD mode. Normally stream continuously — but while Gemini's
@@ -599,7 +653,8 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       await playbackCtx.audioWorklet.addModule('worklets/playback-worklet.js');
       playbackNode = new AudioWorkletNode(playbackCtx, 'playback-worklet');
       // The worklet reports exactly when model audio is audible — this drives
-      // the software echo guard (stricter barge-in / server-mode mic gating).
+      // the software echo guard (stricter barge-in / server-mode mic gating)
+      // and, via the level reports, the call button's audio-reactive glow.
       playbackNode.port.onmessage = (e) => {
         if (e.data === 'playing') { modelSpeaking = true; return; }
         if (e.data === 'idle') {
@@ -607,14 +662,19 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
           serverBarge = false; serverBargeRun = 0;
           // Gate-buffered frames are stale once Gemini stops talking.
           if (!vadSpeaking) preRoll.length = 0;
+          return;
         }
+        if (e.data && e.data.t === 'level') modelLevel = e.data.v;
       };
+      // Fade stage so interruptions can ramp down instead of clicking off.
+      playbackGain = playbackCtx.createGain();
+      playbackNode.connect(playbackGain);
       if (isAndroidWebView()) {
         // WebView: the echoCancellation constraint usually isn't backed by a
         // real canceller, and media-element output plays on the (louder) media
         // audio path — the element route is pure downside there. Use the
         // direct route; the software echo guard handles the bleed.
-        playbackNode.connect(playbackCtx.destination);
+        playbackGain.connect(playbackCtx.destination);
         return;
       }
       // Desktop: route through a MediaStream → hidden <audio> element instead
@@ -624,7 +684,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       // Gemini's voice back into the mic and the VAD triggers on it. Costs a
       // few ms of element buffering — worth it.
       const dest = playbackCtx.createMediaStreamDestination();
-      playbackNode.connect(dest);
+      playbackGain.connect(dest);
       playbackEl = new Audio();
       playbackEl.srcObject = dest.stream;
       try {
@@ -635,8 +695,61 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
         console.error('[callgemini] media-element playback blocked, falling back:', err);
         playbackEl.srcObject = null;
         playbackEl = null;
-        playbackNode.disconnect(dest);
-        playbackNode.connect(playbackCtx.destination);
+        playbackGain.disconnect(dest);
+        playbackGain.connect(playbackCtx.destination);
+      }
+    }
+
+    /**
+     * Soft barge-in: ramp Gemini's volume to zero over ~80 ms, THEN clear the
+     * buffer — a hard postMessage('clear') alone truncates mid-sample and
+     * sounds like a digital click. Gain is restored for the next reply.
+     */
+    function softInterrupt() {
+      if (!playbackNode) return;
+      if (!playbackGain || fading) { playbackNode.port.postMessage('clear'); return; }
+      fading = true;
+      const g = playbackGain.gain;
+      const now = playbackCtx.currentTime;
+      g.cancelScheduledValues(now);
+      g.setValueAtTime(g.value, now);
+      g.linearRampToValueAtTime(0.0001, now + 0.08);
+      setTimeout(() => {
+        playbackNode?.port.postMessage('clear');
+        const t = playbackCtx?.currentTime ?? 0;
+        g.cancelScheduledValues(t);
+        g.setValueAtTime(1, t);
+        fading = false;
+      }, 90);
+    }
+
+    // ── Audio-reactive call button (the minimal "audio mirror") ─────────────
+    // Real levels only: mic RMS (set in onMicFrame) vs. the playback worklet's
+    // rendered RMS. Fast attack / slow decay, capped small — decent, no layout
+    // shift (transform + shadow only).
+    function levelTick() {
+      const target = Math.min(1, Math.max(userLevel, modelLevel) * 4);
+      smoothedLevel = target > smoothedLevel
+        ? smoothedLevel * 0.5 + target * 0.5
+        : smoothedLevel * 0.88;
+      if (smoothedLevel < 0.01) smoothedLevel = 0;
+      if (els.callBtn) {
+        els.callBtn.style.setProperty('--cg-level', smoothedLevel.toFixed(3));
+        els.callBtn.dataset.voice = modelSpeaking ? 'model' : (userLevel * 4 > 0.12 ? 'user' : '');
+      }
+      levelRaf = requestAnimationFrame(levelTick);
+    }
+
+    function startLevelLoop() {
+      if (!levelRaf) levelRaf = requestAnimationFrame(levelTick);
+    }
+
+    function stopLevelLoop() {
+      if (levelRaf) cancelAnimationFrame(levelRaf);
+      levelRaf = 0; userLevel = 0; modelLevel = 0; smoothedLevel = 0;
+      if (els.callBtn) {
+        els.callBtn.style.setProperty('--cg-level', '0');
+        els.callBtn.dataset.voice = '';
       }
     }
 
@@ -645,7 +758,8 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       try { captureCtx?.close(); } catch { /* noop */ }
       try { playbackCtx?.close(); } catch { /* noop */ }
       try { playbackEl?.pause(); if (playbackEl) playbackEl.srcObject = null; } catch { /* noop */ }
-      captureStream = null; captureCtx = null; playbackCtx = null; playbackNode = null; playbackEl = null;
+      captureStream = null; captureCtx = null; playbackCtx = null; playbackNode = null; playbackGain = null; playbackEl = null;
+      fading = false;
     }
 
     async function startCall() {
@@ -674,13 +788,10 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
         setVadBadge(vadEngineKind ?? 'server');   // what's REALLY driving this call
         ws = await openWs();
         // conversationId set → resume that conversation with its history as context.
-        ws.send(JSON.stringify({
-          type: 'start',
-          config: { ...config, vadMode: vadEngineKind ? 'browser' : 'server' },
-          conversationId: activeConversationId,
-        }));
+        ws.send(buildStartFrame());
         await startPlayback();
         await startCapture();
+        startLevelLoop();
         systemLine('Call started', 'info');
       } catch (err) {
         console.error('[callgemini] startCall failed:', err);
@@ -696,6 +807,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       try { ws?.close(); } catch { /* noop */ }
       ws = null;
       stopAudio();
+      stopLevelLoop();
       vadEngineKind = null;
       setVadBadge(null);
       resetVadCallState();
@@ -1123,6 +1235,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     }
     .status-pill[data-state="live"] { background: var(--aura-color-success); color: var(--aura-color-bg); border-color: transparent; }
     .status-pill[data-state="connecting"] { background: var(--aura-color-info); color: var(--aura-color-bg); border-color: transparent; }
+    .status-pill[data-state="reconnecting"] { background: var(--aura-color-warning); color: var(--aura-color-bg); border-color: transparent; }
     .status-pill[data-state="error"] { background: var(--aura-color-danger); color: var(--aura-color-bg); border-color: transparent; }
 
     .cg-header-right { display: flex; align-items: center; gap: 6px; }
@@ -1192,8 +1305,19 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     .call-btn {
       flex: 1; background: var(--aura-color-primary); color: var(--aura-color-bg);
       border-color: transparent; font-size: 15px; padding: 11px 16px;
+      /* Audio mirror: --cg-level (0..1, set per animation frame from real
+         mic/playback RMS) gently scales + glows the button. transform and
+         box-shadow don't reflow, so the layout never shifts. */
+      transform: scale(calc(1 + var(--cg-level, 0) * 0.07));
+      box-shadow: 0 0 calc(var(--cg-level, 0) * 24px)
+        color-mix(in srgb, var(--aura-color-primary) 55%, transparent);
+      will-change: transform, box-shadow;
     }
     .call-btn[data-active="true"] { background: var(--aura-color-danger); }
+    .call-btn[data-voice="model"] {
+      box-shadow: 0 0 calc(var(--cg-level, 0) * 24px)
+        color-mix(in srgb, var(--aura-color-info) 60%, transparent);
+    }
 
     /* Settings modal */
     .modal-overlay {
