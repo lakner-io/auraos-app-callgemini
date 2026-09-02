@@ -21,10 +21,17 @@
  */
 
 import { WebSocketServer } from 'ws';
-import { GoogleGenAI, Modality } from '@google/genai';
+import { GoogleGenAI, Modality, StartSensitivity, EndSensitivity } from '@google/genai';
 import { connectAll } from './mcp.mjs';
 import { register, unregister } from './sessions.mjs';
 import * as conversations from './conversations.mjs';
+
+/**
+ * End-of-speech silence window per "Responsiveness" preset (Settings). Lower =
+ * Gemini commits end-of-speech sooner → the input transcript prints and the
+ * reply starts faster, at the cost of possibly cutting off mid-pause.
+ */
+const RESPONSIVENESS_MS = { snappy: 350, balanced: 600, relaxed: 1000 };
 
 /** Bound the history we replay when resuming so reconnect stays cheap. */
 const RESUME_MAX_TURNS = 20;
@@ -113,6 +120,7 @@ export class CallSession {
     const model = config.model || DEFAULT_MODEL;
     const voiceName = config.voiceName || DEFAULT_VOICE;
     const systemInstruction = config.systemInstruction || DEFAULT_SYSTEM_INSTRUCTION;
+    const silenceDurationMs = RESPONSIVENESS_MS[config.responsiveness] ?? RESPONSIVENESS_MS.balanced;
 
     this.emit({ type: 'status', state: 'connecting' });
 
@@ -148,6 +156,18 @@ export class CallSession {
       systemInstruction,
       inputAudioTranscription: {},
       outputAudioTranscription: {},
+      // Keep per-turn latency flat over a long call — the server rolls the
+      // context window instead of reprocessing all accumulated audio tokens.
+      contextWindowCompression: { slidingWindow: {} },
+      // Commit end-of-speech sooner so the input transcript + reply come faster.
+      realtimeInputConfig: {
+        automaticActivityDetection: {
+          startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_HIGH,
+          endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_HIGH,
+          prefixPaddingMs: 100,
+          silenceDurationMs,
+        },
+      },
       ...(decls.length ? { tools: [{ functionDeclarations: decls }] } : {}),
     };
 
