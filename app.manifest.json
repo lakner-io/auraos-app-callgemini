@@ -2,7 +2,7 @@
   "id": "io.lakner.callgemini",
   "name": "CallGemini",
   "version": "0.1.0",
-  "description": "Voice-first chat with Gemini Live — talk, see the dialog transcribed live, and wire in your own MCP tools.",
+  "description": "Voice-first chat with Gemini Live \u2014 talk, see the dialog transcribed live, and wire in your own MCP tools.",
   "icon": "CG",
   "category": "communication",
   "instanceMode": "single",
@@ -50,5 +50,36 @@
       "category": "View",
       "defaultCombo": "Ctrl+Shift+O"
     }
-  ]
+  ],
+  "store": {
+    "publisher": "Lakner",
+    "homepage": "https://github.com/lakner-io/auraos-app-callgemini",
+    "tags": [
+      "voice",
+      "gemini",
+      "ai",
+      "chat",
+      "mcp"
+    ],
+    "longDescription": "Voice-first chat with Google Gemini Live, as an AuraOS window. Talk to the model and watch both sides of the dialog transcribed live; conversations are kept so you can resume an earlier one. The audio path is built for real calls rather than push-to-talk: browser-side voice activity detection, RNNoise denoising, gain staging, a dynamic jitter cushion, and local barge-in so you can interrupt mid-sentence. You can also register your own MCP tools and let the model call them during a call. Set GEMINI_API_KEY in AuraOS Context, or paste a key in the app settings on first run.",
+    "screenshots": [
+      "https://cdn.lakner.io/files/auraos/nexus/apps/io.lakner.callgemini/assets/Screenshot_callgemini_01.jpg",
+      "https://cdn.lakner.io/files/auraos/nexus/apps/io.lakner.callgemini/assets/Screenshot_callgemini_02.jpg",
+      "https://cdn.lakner.io/files/auraos/nexus/apps/io.lakner.callgemini/assets/Screenshot_callgemini_03.jpg"
+    ]
+  },
+  "publish": {
+    "channels": [
+      "stable"
+    ],
+    "ignore": [
+      "node_modules",
+      ".astro",
+      "dist",
+      ".next",
+      ".turbo",
+      ".cache",
+      "io.lakner.callgemini"
+    ]
+  }
 }

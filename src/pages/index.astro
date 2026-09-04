@@ -19,14 +19,14 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
   <div class="cg-app" data-role="app" data-sidebar="closed">
     <!-- Conversations drawer (overlay) + backdrop -->
     <aside class="cg-sidebar" data-role="sidebar" aria-label="Conversations">
-      <button class="btn new-chat-btn" data-action="new-chat" type="button">＋ New chat</button>
+      <button class="btn new-chat-btn" data-action="new-chat" type="button"><span data-licon="plus"></span> New chat</button>
       <div class="conv-list" data-role="conv-list"></div>
     </aside>
     <div class="cg-backdrop" data-role="sidebar-backdrop"></div>
 
     <header class="cg-header">
       <div class="cg-header-left">
-        <button class="icon-btn" data-action="toggle-sidebar" type="button" aria-label="Conversations" title="Conversations">☰</button>
+        <button class="icon-btn" data-action="toggle-sidebar" type="button" aria-label="Conversations" title="Conversations"><span data-licon="menu"></span></button>
         <div class="cg-title">
           <span class="cg-logo">CG</span>
           <span>CallGemini</span>
@@ -52,7 +52,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     </form>
 
     <div class="cg-controls">
-      <button class="btn btn-icon" data-action="settings" type="button" title="Settings" aria-label="Settings">⚙</button>
+      <button class="btn btn-icon" data-action="settings" type="button" title="Settings" aria-label="Settings"><span data-licon="settings"></span></button>
       <button class="btn call-btn" data-action="toggle-call" data-active="false" type="button">Call</button>
       <button class="btn btn-ghost" data-action="mute" data-muted="false" type="button" disabled>Mute</button>
     </div>
@@ -62,7 +62,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       <div class="modal-panel">
         <div class="modal-head">
           <h2 class="modal-title">Settings</h2>
-          <button class="btn btn-icon" data-action="settings-close" type="button" aria-label="Close">✕</button>
+          <button class="btn btn-icon" data-action="settings-close" type="button" aria-label="Close"><span data-licon="x"></span></button>
         </div>
 
         <div class="modal-body">
@@ -81,6 +81,12 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
           <span class="field-label">Voice</span>
           <select class="field-input" data-field="voice"></select>
         </label>
+
+        <div class="field">
+          <span class="field-label">Languages</span>
+          <div class="lang-chips" data-role="lang-chips"></div>
+          <span class="field-hint">Tell Gemini which languages you speak so it understands you better. Any = auto-detect. Applies to your next call.</span>
+        </div>
 
         <label class="field">
           <span class="field-label">Noise reduction</span>
@@ -129,6 +135,24 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     // 24 kHz PCM playback, live transcript rendering, tool chips, settings, and
     // config persistence. Elements are found by data-* hooks, styled by class;
     // transcript rows are created here at runtime.
+    import { createElement as lucideEl, Menu, Settings, X, Trash2, Plus } from 'lucide';
+
+    // Lucide SVG icons (stroke=currentColor → inherit the button's theme color).
+    const LUCIDE = { menu: Menu, settings: Settings, x: X, 'trash-2': Trash2, plus: Plus };
+    function icon(node, size = 18) {
+      const el = lucideEl(node);
+      el.setAttribute('width', String(size));
+      el.setAttribute('height', String(size));
+      return el;
+    }
+    /** Replace every <span data-licon="name"> placeholder with its SVG. */
+    function mountIcons(root = document) {
+      root.querySelectorAll('[data-licon]').forEach((el) => {
+        const node = LUCIDE[el.dataset.licon];
+        if (node && !el.firstChild) el.appendChild(icon(node));
+      });
+    }
+
     const APP_ID = 'io.lakner.callgemini';
     const KV_URL = `/api/kv/app/${APP_ID}/config`; // absolute → shell KV route, app identified by Referer
 
@@ -140,8 +164,27 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       responsiveness: 'balanced', // snappy | balanced | relaxed — end-of-speech window
       vadMode: 'server',          // 'server' (automatic detection) | 'browser' (local Silero VAD)
       noiseReduction: 'ai',       // 'ai' (RNNoise + browser filters) | 'browser' (filters only)
+      languages: [],              // BCP-47 hints for input understanding; [] = auto-detect
       mcpServers: [],
     };
+    // BCP-47 language hints — German & English first, then popular ones.
+    const LANGUAGES = [
+      { code: 'de-DE', label: 'Deutsch' },
+      { code: 'en-US', label: 'English' },
+      { code: 'es-ES', label: 'Español' },
+      { code: 'fr-FR', label: 'Français' },
+      { code: 'it-IT', label: 'Italiano' },
+      { code: 'pt-BR', label: 'Português' },
+      { code: 'nl-NL', label: 'Nederlands' },
+      { code: 'pl-PL', label: 'Polski' },
+      { code: 'ru-RU', label: 'Русский' },
+      { code: 'tr-TR', label: 'Türkçe' },
+      { code: 'ar-XA', label: 'العربية' },
+      { code: 'hi-IN', label: 'हिन्दी' },
+      { code: 'zh-CN', label: '中文' },
+      { code: 'ja-JP', label: '日本語' },
+      { code: 'ko-KR', label: '한국어' },
+    ];
     const NOISE_OPTS = [
       { value: 'ai', label: 'AI + Audio DSP (recommended)' },
       { value: 'browser', label: 'Audio DSP only' },
@@ -188,6 +231,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       fVoice: $('[data-field="voice"]'),
       fVadMode: $('[data-field="vadMode"]'),
       fNoise: $('[data-field="noiseReduction"]'),
+      langChips: $('[data-role="lang-chips"]'),
       fResponsiveness: $('[data-field="responsiveness"]'),
       fSystem: $('[data-field="systemInstruction"]'),
       mcpList: $('[data-role="mcp-list"]'),
@@ -970,6 +1014,35 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       els.modelField.dataset.custom = String(els.fModelPreset.value === 'custom');
     }
 
+    // ── Languages multi-select (toggle chips; empty = Any/auto-detect) ──────
+    function renderLangChips(selected) {
+      const on = new Set(selected ?? []);
+      els.langChips.textContent = '';
+      const any = document.createElement('button');
+      any.type = 'button'; any.className = 'lang-chip'; any.dataset.lang = '';
+      any.textContent = 'Any'; any.dataset.on = String(on.size === 0);
+      els.langChips.appendChild(any);
+      for (const l of LANGUAGES) {
+        const chip = document.createElement('button');
+        chip.type = 'button'; chip.className = 'lang-chip'; chip.dataset.lang = l.code;
+        chip.textContent = l.label; chip.dataset.on = String(on.has(l.code));
+        els.langChips.appendChild(chip);
+      }
+    }
+
+    function syncAnyChip() {
+      const anySelected = [...els.langChips.querySelectorAll('.lang-chip[data-lang]')]
+        .some((c) => c.dataset.lang && c.dataset.on === 'true');
+      const any = els.langChips.querySelector('.lang-chip[data-lang=""]');
+      if (any) any.dataset.on = String(!anySelected);
+    }
+
+    function readLangChips() {
+      return [...els.langChips.querySelectorAll('.lang-chip[data-lang]')]
+        .filter((c) => c.dataset.lang && c.dataset.on === 'true')
+        .map((c) => c.dataset.lang);
+    }
+
     function openSettings() {
       els.fApiKey.value = config.apiKey ?? '';
       els.fSystem.value = config.systemInstruction ?? '';
@@ -983,6 +1056,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       fillSelect(els.fVadMode, VAD_MODE_OPTS, config.vadMode ?? DEFAULTS.vadMode);
       fillSelect(els.fNoise, NOISE_OPTS, config.noiseReduction ?? DEFAULTS.noiseReduction);
       fillSelect(els.fResponsiveness, RESPONSIVENESS_OPTS, config.responsiveness ?? DEFAULTS.responsiveness);
+      renderLangChips(config.languages ?? DEFAULTS.languages);
       renderMcpRows();
       els.modal.dataset.open = 'true';
     }
@@ -1001,6 +1075,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
         vadMode: els.fVadMode.value || DEFAULTS.vadMode,
         noiseReduction: els.fNoise.value || DEFAULTS.noiseReduction,
         responsiveness: els.fResponsiveness.value || DEFAULTS.responsiveness,
+        languages: readLangChips(),
         systemInstruction: els.fSystem.value.trim(),
         mcpServers: readMcpRows(),
       };
@@ -1037,15 +1112,18 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       });
     }
 
+    /** Placeholder row, shown whenever the list holds no conversations. */
+    function showConvEmpty() {
+      if (!els.convList || els.convList.querySelector('.conv-empty')) return;
+      const empty = document.createElement('div');
+      empty.className = 'conv-empty';
+      empty.textContent = 'No conversations yet';
+      els.convList.appendChild(empty);
+    }
+
     function renderConvList(items) {
       els.convList.textContent = '';
-      if (!items.length) {
-        const empty = document.createElement('div');
-        empty.className = 'conv-empty';
-        empty.textContent = 'No conversations yet';
-        els.convList.appendChild(empty);
-        return;
-      }
+      if (!items.length) { showConvEmpty(); return; }
       for (const it of items) {
         const row = document.createElement('div');
         row.className = 'conv-item';
@@ -1067,18 +1145,44 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
         del.className = 'conv-del';
         del.dataset.action = 'conv-del';
         del.setAttribute('aria-label', 'Delete');
-        del.textContent = '✕';
+        del.appendChild(icon(Trash2, 16));
 
-        row.append(main, del);
+        // Inline delete confirmation, shown in place of the row (No / Yes).
+        const confirm = document.createElement('div');
+        confirm.className = 'conv-confirm';
+        const q = document.createElement('span');
+        q.className = 'conv-confirm-q';
+        q.textContent = 'Delete?';
+        const no = document.createElement('button');
+        no.type = 'button'; no.className = 'conv-confirm-no'; no.dataset.action = 'conv-del-no';
+        no.textContent = 'No';
+        const yes = document.createElement('button');
+        yes.type = 'button'; yes.className = 'conv-confirm-yes'; yes.dataset.action = 'conv-del-yes';
+        yes.textContent = 'Yes';
+        confirm.append(q, yes, no);
+
+        row.append(main, del, confirm);
         els.convList.appendChild(row);
       }
     }
 
-    async function refreshConvList() {
+    async function loadConvList() {
+      // `no-store`: a cached 200 here would resurrect a row we just deleted.
       try {
-        const res = await fetch('api/conversations');
-        if (res.ok) renderConvList(await res.json());
-      } catch { /* offline — leave list as-is */ }
+        const res = await fetch('api/conversations', { cache: 'no-store' });
+        if (!res.ok) { systemLine(`Could not refresh the conversation list (${res.status})`, 'error'); return; }
+        renderConvList(await res.json());
+      } catch (err) {
+        console.error('[callgemini] conversation list refresh failed:', err);
+        systemLine('Could not refresh the conversation list', 'error');
+      }
+    }
+
+    async function refreshConvList() {
+      // Don't yank a row out from under an open delete confirmation (background
+      // refresh only — an explicit delete re-renders through loadConvList()).
+      if (els.convList?.querySelector('.conv-item[data-confirm="true"]')) return;
+      await loadConvList();
     }
 
     // Debounced refresh while a call streams turns (title/order change server-side).
@@ -1125,30 +1229,67 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       }
     }
 
-    function newChat() {
+    function newChat({ keepSidebar = false } = {}) {
       if (inCall) endCall('new-chat');
       activeConversationId = null;
       showEmptyState();
       activeBubbles.user = null; activeBubbles.model = null; toolChips.clear();
       setStatus('idle');
-      closeSidebar();
+      if (!keepSidebar) closeSidebar();
       updateActiveConvHighlight();
     }
 
+    /** Drop the on-screen conversation without touching the sidebar. */
+    function unloadActiveConversation() {
+      try { if (inCall) endCall('delete'); } catch (err) { console.error(err); }
+      activeConversationId = null;
+      showEmptyState();
+      activeBubbles.user = null; activeBubbles.model = null; toolChips.clear();
+      setStatus('idle');
+    }
+
     async function deleteConversation(id) {
-      try { await fetch(`api/conversations/${id}`, { method: 'DELETE' }); } catch { /* ignore */ }
-      if (id === activeConversationId) newChat();
-      refreshConvList();
+      const wasActive = id === activeConversationId;
+
+      // The row (and the Yes/No question standing in its place) goes away on
+      // the click itself — NOT on the DELETE round-trip and not on the list GET
+      // that follows it. Either request can fail, be cached, or never resolve;
+      // when the visible update hangs off them, that reads as "Yes does
+      // nothing". The list GET below is reconciliation only, so a delete that
+      // did not reach the server puts the row back.
+      const row = [...(els.convList?.querySelectorAll('.conv-item') ?? [])].find((r) => r.dataset.id === id);
+      row?.remove();
+      if (!els.convList?.querySelector('.conv-item')) showConvEmpty();
+      if (wasActive) unloadActiveConversation();
+
+      try {
+        const res = await fetch(`api/conversations/${id}`, { method: 'DELETE', cache: 'no-store' });
+        if (!res.ok) systemLine(`Could not delete that conversation (${res.status})`, 'error');
+      } catch (err) {
+        console.error('[callgemini] delete request failed:', err);
+        systemLine('Could not delete that conversation', 'error');
+      }
+
+      await loadConvList();
     }
 
     els.toggleSidebarBtn?.addEventListener('click', toggleSidebar);
-    els.newChatBtn?.addEventListener('click', newChat);
+    els.newChatBtn?.addEventListener('click', () => newChat());
     els.backdrop?.addEventListener('click', closeSidebar);
     els.convList?.addEventListener('click', (e) => {
       const item = e.target.closest('.conv-item');
       if (!item) return;
       const id = item.dataset.id;
-      if (e.target.closest('[data-action="conv-del"]')) { e.stopPropagation(); deleteConversation(id); return; }
+      // Delete flow: trash → inline confirm (No / Yes) in place of the row.
+      if (e.target.closest('[data-action="conv-del-yes"]')) { e.stopPropagation(); deleteConversation(id); return; }
+      if (e.target.closest('[data-action="conv-del-no"]')) { e.stopPropagation(); item.dataset.confirm = 'false'; return; }
+      if (e.target.closest('[data-action="conv-del"]')) {
+        e.stopPropagation();
+        els.convList.querySelectorAll('.conv-item[data-confirm="true"]').forEach((r) => { r.dataset.confirm = 'false'; });
+        item.dataset.confirm = 'true';
+        return;
+      }
+      if (item.dataset.confirm === 'true') return; // don't load while awaiting a Yes/No
       loadConversation(id);
     });
 
@@ -1169,6 +1310,21 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       config.mcpServers = readMcpRows();
       config.mcpServers.push({ url: '', transport: 'http' });
       renderMcpRows();
+    });
+    // Language chips: toggle a language, or "Any" to clear all → auto-detect.
+    els.langChips?.addEventListener('click', (e) => {
+      const chip = e.target.closest('.lang-chip');
+      if (!chip) return;
+      if (chip.dataset.lang === '') {
+        // "Any" → turn every specific language off.
+        els.langChips.querySelectorAll('.lang-chip[data-lang]').forEach((c) => {
+          if (c.dataset.lang) c.dataset.on = 'false';
+        });
+        chip.dataset.on = 'true';
+        return;
+      }
+      chip.dataset.on = String(chip.dataset.on !== 'true');
+      syncAnyChip();
     });
     // Delegated remove for dynamically-rendered MCP rows.
     els.mcpList?.addEventListener('click', (e) => {
@@ -1201,6 +1357,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     }).catch(() => { /* running outside the OS shell */ });
 
     // Boot.
+    mountIcons();
     setStatus('idle');
     updateControls();
     loadConfig().then(() => {
@@ -1254,7 +1411,10 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     }
     .cg-app[data-sidebar="open"] .cg-backdrop { opacity: 1; pointer-events: auto; }
 
-    .new-chat-btn { width: 100%; text-align: left; }
+    .new-chat-btn { width: 100%; text-align: left; display: flex; align-items: center; gap: 8px; }
+    /* Lucide SVG icons: inherit currentColor, center inside their buttons. */
+    .cg-app svg { display: block; flex: 0 0 auto; }
+    .icon-btn, .btn-icon, .conv-del { display: inline-flex; align-items: center; justify-content: center; }
     .conv-list { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
     .conv-empty { color: var(--aura-color-text-dim); font-size: 13px; text-align: center; padding: 16px 8px; }
     .conv-item {
@@ -1271,12 +1431,27 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     }
     .conv-time { font-size: 11px; color: var(--aura-color-text-dim); }
     .conv-del {
-      flex: 0 0 auto; font: inherit; font-size: 12px; line-height: 1; cursor: pointer;
+      flex: 0 0 auto; font: inherit; font-size: 14px; line-height: 1; cursor: pointer;
       border: none; background: transparent; color: var(--aura-color-text-dim);
       padding: 4px 6px; border-radius: 6px; opacity: 0;
     }
-    .conv-item:hover .conv-del { opacity: 1; }
+    /* Trash appears on hover, and stays visible on the selected chat. */
+    .conv-item:hover .conv-del,
+    .conv-item[data-active="true"] .conv-del { opacity: 1; }
     .conv-del:hover { color: var(--aura-color-danger); background: var(--aura-color-surface); }
+
+    /* Inline delete confirmation — replaces the row content in place. */
+    .conv-confirm { display: none; flex: 1; align-items: center; gap: 6px; }
+    .conv-item[data-confirm="true"] .conv-main,
+    .conv-item[data-confirm="true"] .conv-del { display: none; }
+    .conv-item[data-confirm="true"] .conv-confirm { display: flex; }
+    .conv-confirm-q { flex: 1; min-width: 0; font-size: 13px; color: var(--aura-color-text-dim); }
+    .conv-confirm-no, .conv-confirm-yes {
+      flex: 0 0 auto; font: inherit; font-size: 12px; font-weight: 600; cursor: pointer;
+      padding: 4px 12px; border-radius: 6px; border: 1px solid var(--aura-color-border);
+    }
+    .conv-confirm-no { background: var(--aura-color-surface-2); color: var(--aura-color-text); }
+    .conv-confirm-yes { background: var(--aura-color-danger); color: var(--aura-color-bg); border-color: transparent; }
 
     .cg-header {
       display: flex;
@@ -1411,9 +1586,9 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     }
     /* Fixed header + footer, scrollable middle. */
     .modal-head, .modal-foot { display: flex; align-items: center; justify-content: space-between; flex: 0 0 auto; }
-    .modal-head { padding: 16px 18px; border-bottom: 1px solid var(--aura-color-border); }
-    .modal-body { flex: 1 1 auto; overflow-y: auto; padding: 18px; display: flex; flex-direction: column; gap: 14px; }
-    .modal-foot { gap: 10px; padding: 14px 18px; border-top: 1px solid var(--aura-color-border); }
+    .modal-head { padding: 9px 14px; border-bottom: 1px solid var(--aura-color-border); }
+    .modal-body { flex: 1 1 auto; overflow-y: auto; padding: 16px 18px; display: flex; flex-direction: column; gap: 14px; }
+    .modal-foot { gap: 10px; padding: 9px 14px; border-top: 1px solid var(--aura-color-border); }
     .modal-foot .call-btn { flex: 0 0 auto; }
     .modal-title { margin: 0; font-size: 16px; }
 
@@ -1424,6 +1599,16 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     /* Custom model id input: only shown when the Model preset is "Custom…". */
     .model-custom { display: none; }
     .field[data-custom="true"] .model-custom { display: block; }
+
+    /* Languages multi-select chips (toggle). */
+    .lang-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+    .lang-chip {
+      font: inherit; font-size: 12px; font-weight: 600; cursor: pointer;
+      padding: 5px 11px; border-radius: 999px;
+      background: var(--aura-color-surface-2); color: var(--aura-color-text);
+      border: 1px solid var(--aura-color-border);
+    }
+    .lang-chip[data-on="true"] { background: var(--aura-color-primary); color: var(--aura-color-bg); border-color: transparent; }
 
     .mcp-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 6px; }
     .mcp-row { display: flex; gap: 6px; align-items: center; }

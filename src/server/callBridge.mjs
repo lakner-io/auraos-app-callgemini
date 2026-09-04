@@ -172,7 +172,10 @@ export class CallSession {
       responseModalities: [Modality.AUDIO],
       speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName } } },
       systemInstruction,
-      inputAudioTranscription: {},
+      // Language hints (Settings → Languages): BCP-47 codes bias understanding
+      // toward the user's languages; empty = auto-detect. Output language is
+      // left auto so replies follow whichever language the user actually spoke.
+      inputAudioTranscription: (config.languages?.length ? { languageCodes: config.languages } : {}),
       outputAudioTranscription: {},
       // Keep per-turn latency flat over a long call — the server rolls the
       // context window instead of reprocessing all accumulated audio tokens.
