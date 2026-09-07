@@ -24,6 +24,26 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     </aside>
     <div class="cg-backdrop" data-role="sidebar-backdrop"></div>
 
+    <!-- MCP servers drawer (right overlay): per-conversation ON/OFF + Skip -->
+    <aside class="cg-mcpbar" data-role="mcpbar" aria-label="MCP servers">
+      <div class="mcpbar-head">
+        <span class="mcpbar-title">MCP servers</span>
+        <div class="mcpbar-head-actions">
+          <button class="icon-btn" data-action="mcpbar-info" type="button" aria-label="How this works" aria-expanded="false" title="How this works"><span data-licon="info"></span></button>
+          <button class="icon-btn" data-action="mcpbar-close" type="button" aria-label="Close"><span data-licon="x"></span></button>
+        </div>
+        <!-- Info popover: toggled by the (i) button, closed by clicking anywhere else. -->
+        <div class="mcpbar-info" data-role="mcpbar-info" data-open="false" role="note">
+          <p>Per conversation.</p>
+          <p><strong>ON/OFF</strong> decides what Gemini can see (changing it re-dials a live call).</p>
+          <p><strong>Skip</strong> keeps the tools visible but answers every call with “skipped”.</p>
+          <p><strong>Temporary</strong> servers are added by other apps through the CallGemini MCP server.</p>
+        </div>
+      </div>
+      <div class="mcp-toggle-list" data-role="mcp-toggle-list"></div>
+      <button class="btn btn-ghost btn-sm" data-action="mcpbar-settings" type="button">Manage servers…</button>
+    </aside>
+
     <header class="cg-header">
       <div class="cg-header-left">
         <button class="icon-btn" data-action="toggle-sidebar" type="button" aria-label="Conversations" title="Conversations"><span data-licon="menu"></span></button>
@@ -34,6 +54,8 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       </div>
       <div class="cg-header-right">
         <span class="status-pill vad-pill" data-role="vad-badge" data-kind="none"></span>
+        <button class="status-pill mcp-pill" data-action="toggle-mcpbar" data-role="mcp-badge" data-empty="true" type="button"
+                title="MCP servers for this conversation" aria-label="MCP servers"><span data-licon="plug"></span><span data-role="mcp-badge-text">0/0</span></button>
         <span class="status-pill" data-role="status" data-state="idle">Idle</span>
       </div>
     </header>
@@ -54,7 +76,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     <div class="cg-controls">
       <button class="btn btn-icon" data-action="settings" type="button" title="Settings" aria-label="Settings"><span data-licon="settings"></span></button>
       <button class="btn call-btn" data-action="toggle-call" data-active="false" type="button">Call</button>
-      <button class="btn btn-ghost" data-action="mute" data-muted="false" type="button" disabled>Mute</button>
+      <button class="btn btn-ghost mute-btn" data-action="mute" data-muted="false" type="button" disabled title="Mute microphone" aria-label="Mute microphone" aria-pressed="false"><span class="mute-icon" data-role="mute-icon"></span><span class="mute-label" data-role="mute-label">Mute</span></button>
     </div>
 
     <!-- Settings modal -->
@@ -135,10 +157,10 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     // 24 kHz PCM playback, live transcript rendering, tool chips, settings, and
     // config persistence. Elements are found by data-* hooks, styled by class;
     // transcript rows are created here at runtime.
-    import { createElement as lucideEl, Menu, Settings, X, Trash2, Plus } from 'lucide';
+    import { createElement as lucideEl, Menu, Settings, X, Trash2, Plus, Plug, Mic, MicOff, Info } from 'lucide';
 
     // Lucide SVG icons (stroke=currentColor → inherit the button's theme color).
-    const LUCIDE = { menu: Menu, settings: Settings, x: X, 'trash-2': Trash2, plus: Plus };
+    const LUCIDE = { menu: Menu, settings: Settings, x: X, 'trash-2': Trash2, plus: Plus, plug: Plug, mic: Mic, 'mic-off': MicOff, info: Info };
     function icon(node, size = 18) {
       const el = lucideEl(node);
       el.setAttribute('width', String(size));
@@ -217,9 +239,19 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       newChatBtn: $('[data-action="new-chat"]'),
       status: $('[data-role="status"]'),
       vadBadge: $('[data-role="vad-badge"]'),
+      mcpBadge: $('[data-role="mcp-badge"]'),
+      mcpBadgeText: $('[data-role="mcp-badge-text"]'),
+      mcpbar: $('[data-role="mcpbar"]'),
+      mcpToggleList: $('[data-role="mcp-toggle-list"]'),
+      mcpbarClose: $('[data-action="mcpbar-close"]'),
+      mcpbarInfoBtn: $('[data-action="mcpbar-info"]'),
+      mcpbarInfo: $('[data-role="mcpbar-info"]'),
+      mcpbarSettings: $('[data-action="mcpbar-settings"]'),
       transcript: $('[data-role="transcript"]'),
       callBtn: $('[data-action="toggle-call"]'),
       muteBtn: $('[data-action="mute"]'),
+      muteIcon: $('[data-role="mute-icon"]'),
+      muteLabel: $('[data-role="mute-label"]'),
       settingsBtn: $('[data-action="settings"]'),
       textForm: $('[data-form="text"]'),
       textInput: $('[data-role="text-input"]'),
@@ -245,6 +277,15 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     let inCall = false;
     let muted = false;
     let activeConversationId = null; // null = new chat; set → resume on next call
+    // Per-conversation MCP toggles (server URLs). Empty = all ON, nothing skipped.
+    let mcpDisabled = new Set();
+    let mcpSkipped = new Set();
+    const mcpLive = new Map();       // url → last server-side report (tools / error), during a call
+    // Temporary MCP servers of the active conversation (record field
+    // mcpTemporary). Added/removed by other apps through the CallGemini MCP
+    // server; the X button here removes one.
+    let tempServers = [];
+    let mcpPollTimer = null;         // refreshes tempServers while the drawer is open and no call runs
     let convRefreshTimer = null;
     let captureCtx = null;
     let captureStream = null;
@@ -397,6 +438,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
         type: 'start',
         config: { ...config, vadMode: vadEngineKind ? 'browser' : 'server' },
         conversationId: activeConversationId,
+        mcp: { disabled: [...mcpDisabled], skipped: [...mcpSkipped] },
       });
     }
 
@@ -456,6 +498,15 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
           activeConversationId = msg.id;
           updateActiveConvHighlight();
           scheduleConvRefresh();
+          break;
+        case 'mcp':
+          // Where every server stands on the server side right now — and the
+          // authoritative temporary list (another app may have just added one).
+          mcpLive.clear();
+          for (const srv of msg.servers ?? []) mcpLive.set(srv.url, srv);
+          tempServers = (msg.servers ?? []).filter((s) => s.temporary)
+            .map((s) => ({ url: s.url, transport: s.transport ?? 'http', name: s.name ?? '', addedAt: s.addedAt ?? null, toolCount: s.toolCount ?? null }));
+          renderMcpBar();
           break;
         default:
           break;
@@ -931,6 +982,8 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       resetVadCallState();
       finalizeTurn();
       toolChips.clear();
+      mcpLive.clear();
+      renderMcpBar();
       setStatus('ended');
       updateControls();
     }
@@ -953,7 +1006,12 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       if (els.muteBtn) {
         els.muteBtn.disabled = !inCall;
         els.muteBtn.dataset.muted = String(muted);
-        els.muteBtn.textContent = muted ? 'Unmute' : 'Mute';
+        els.muteBtn.setAttribute('aria-pressed', String(muted));
+        els.muteBtn.title = muted ? 'Unmute microphone' : 'Mute microphone';
+        els.muteBtn.setAttribute('aria-label', els.muteBtn.title);
+        // Mic (live) ↔ MicOff (muted): swap the SVG so the state is readable at a glance.
+        if (els.muteIcon) { els.muteIcon.textContent = ''; els.muteIcon.appendChild(icon(muted ? MicOff : Mic, 18)); }
+        if (els.muteLabel) els.muteLabel.textContent = muted ? 'Unmute' : 'Mute';
       }
     }
 
@@ -1084,6 +1142,8 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       // KV write only matters for persistence across reloads.
       closeSettings();
       systemLine('Settings saved', 'info');
+      renderMcpBadge();
+      renderMcpBar();
       saveConfig().then((ok) => {
         if (ok === false) systemLine('Kept for this session, but could not persist settings.', 'error');
       });
@@ -1091,9 +1151,250 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
 
     // ── Conversations sidebar (overlay drawer) ──────────────────────────────
     function isSidebarOpen() { return els.appEl?.dataset.sidebar === 'open'; }
-    function openSidebar() { if (els.appEl) els.appEl.dataset.sidebar = 'open'; refreshConvList(); }
+    function openSidebar() { closeMcpBar(); if (els.appEl) els.appEl.dataset.sidebar = 'open'; refreshConvList(); }
     function closeSidebar() { if (els.appEl) els.appEl.dataset.sidebar = 'closed'; }
     function toggleSidebar() { if (isSidebarOpen()) closeSidebar(); else openSidebar(); }
+
+    // ── MCP servers drawer (right overlay) + header badge ───────────────────
+    function isMcpBarOpen() { return els.appEl?.dataset.mcpbar === 'open'; }
+    function openMcpBar() {
+      closeSidebar();
+      renderMcpBar();
+      if (els.appEl) els.appEl.dataset.mcpbar = 'open';
+      // Outside a call there is no WS to push changes, so poll the record.
+      refreshTempServers();
+      if (!mcpPollTimer) mcpPollTimer = setInterval(refreshTempServers, 3000);
+    }
+    function setMcpInfo(open) {
+      if (!els.mcpbarInfo) return;
+      els.mcpbarInfo.dataset.open = String(open);
+      els.mcpbarInfoBtn?.setAttribute('aria-expanded', String(open));
+    }
+    function closeMcpBar() {
+      if (els.appEl) els.appEl.dataset.mcpbar = 'closed';
+      setMcpInfo(false);
+      if (mcpPollTimer) { clearInterval(mcpPollTimer); mcpPollTimer = null; }
+    }
+    function toggleMcpBar() { if (isMcpBarOpen()) closeMcpBar(); else openMcpBar(); }
+
+    /** Every server this conversation can use: Settings ones first, then the
+     * conversation's temporary ones (a temporary URL that duplicates a
+     * configured one is ignored — Settings wins, same rule as the server). */
+    function mcpServers() {
+      const out = [];
+      const seen = new Set();
+      for (const s of config.mcpServers ?? []) {
+        if (!s?.url || seen.has(s.url)) continue;
+        seen.add(s.url);
+        out.push({ url: s.url, transport: s.transport ?? 'http', name: '', temporary: false });
+      }
+      for (const t of tempServers) {
+        if (!t?.url || seen.has(t.url)) continue;
+        seen.add(t.url);
+        out.push({ url: t.url, transport: t.transport ?? 'http', name: t.name ?? '', temporary: true });
+      }
+      return out;
+    }
+
+    /** Re-read the active conversation's temporary servers (no call → no WS). */
+    async function refreshTempServers() {
+      if (!activeConversationId || inCall) return;
+      try {
+        const res = await fetch(`api/conversations/${activeConversationId}`, { cache: 'no-store' });
+        if (!res.ok) return;
+        const conv = await res.json();
+        const next = Array.isArray(conv.mcpTemporary) ? conv.mcpTemporary : [];
+        if (JSON.stringify(next) !== JSON.stringify(tempServers)) { tempServers = next; renderMcpBar(); }
+      } catch (err) {
+        console.error('[callgemini] temporary server refresh failed:', err);
+      }
+    }
+
+    /** "host/path" for a server URL — enough to tell servers apart in a row. */
+    function mcpDisplayName(url) {
+      try {
+        const u = new URL(url);
+        return `${u.host}${u.pathname === '/' ? '' : u.pathname}`;
+      } catch { return url; }
+    }
+
+    /** Header badge: enabled/total, tinted when something is being skipped. */
+    function renderMcpBadge() {
+      if (!els.mcpBadge) return;
+      const servers = mcpServers();
+      const enabled = servers.filter((s) => !mcpDisabled.has(s.url));
+      const skipping = enabled.some((s) => mcpSkipped.has(s.url));
+      els.mcpBadgeText.textContent = `${enabled.length}/${servers.length}`;
+      els.mcpBadge.dataset.empty = String(servers.length === 0);
+      els.mcpBadge.dataset.skipping = String(skipping);
+      els.mcpBadge.title = servers.length
+        ? `${enabled.length} of ${servers.length} MCP server(s) enabled${skipping ? ' · some skipped' : ''}`
+        : 'No MCP servers configured';
+    }
+
+    /** Rows are runtime DOM (createElement), so their styles are global. */
+    function renderMcpBar() {
+      renderMcpBadge();
+      if (!els.mcpToggleList) return;
+      els.mcpToggleList.textContent = '';
+      const servers = mcpServers();
+      const groupTitle = (text) => {
+        const h = document.createElement('div');
+        h.className = 'mcp-group-title';
+        h.textContent = text;
+        els.mcpToggleList.appendChild(h);
+      };
+      const emptyRow = (text) => {
+        const empty = document.createElement('div');
+        empty.className = 'mcp-toggle-empty';
+        empty.textContent = text;
+        els.mcpToggleList.appendChild(empty);
+      };
+      groupTitle('Configured (Settings)');
+      if (!servers.some((s) => !s.temporary)) emptyRow('No MCP servers configured yet.');
+      for (const srv of servers.filter((s) => !s.temporary)) els.mcpToggleList.appendChild(mcpRow(srv));
+      groupTitle('Temporary');
+      if (!servers.some((s) => s.temporary)) {
+        emptyRow(activeConversationId
+          ? 'None for this conversation. Other apps add them through the CallGemini MCP server (add_mcp_server).'
+          : 'Start or load a conversation first — temporary servers belong to one conversation.');
+      }
+      for (const srv of servers.filter((s) => s.temporary)) els.mcpToggleList.appendChild(mcpRow(srv));
+    }
+
+    /** One server row: name/meta, ON/OFF switch, Skip, and X for temporary ones. */
+    function mcpRow(srv) {
+      {
+        const on = !mcpDisabled.has(srv.url);
+        const skip = mcpSkipped.has(srv.url);
+        const live = mcpLive.get(srv.url);
+
+        const row = document.createElement('div');
+        row.className = 'mcp-toggle-row';
+        row.dataset.url = srv.url;
+        row.dataset.on = String(on);
+        row.dataset.temporary = String(!!srv.temporary);
+
+        const main = document.createElement('div');
+        main.className = 'mcp-toggle-main';
+        const name = document.createElement('div');
+        name.className = 'mcp-toggle-name';
+        name.textContent = srv.name || mcpDisplayName(srv.url);
+        name.title = srv.url;
+        const meta = document.createElement('div');
+        meta.className = 'mcp-toggle-meta';
+        let state = 'idle';
+        let info;
+        if (!on) info = 'off';
+        else if (live?.error) { state = 'failed'; info = `connect failed: ${live.error}`; }
+        else if (live?.ok) info = `${live.tools} tool${live.tools === 1 ? '' : 's'}${skip ? ' · skipping' : ''}`;
+        else if (skip) { state = 'skipping'; info = 'skipping'; }
+        else info = inCall ? 'connecting…' : 'on';
+        meta.dataset.state = state;
+        meta.textContent = `${(srv.transport ?? 'http').toUpperCase()} · ${info}`;
+        main.append(name, meta);
+
+        const onoff = document.createElement('button');
+        onoff.type = 'button';
+        onoff.className = 'mcp-switch';
+        onoff.dataset.action = 'mcp-onoff';
+        onoff.dataset.on = String(on);
+        onoff.setAttribute('role', 'switch');
+        onoff.setAttribute('aria-checked', String(on));
+        onoff.textContent = on ? 'ON' : 'OFF';
+        onoff.title = on ? 'Turn off for this conversation' : 'Turn on for this conversation';
+
+        const skipBtn = document.createElement('button');
+        skipBtn.type = 'button';
+        skipBtn.className = 'mcp-skip';
+        skipBtn.dataset.action = 'mcp-skip';
+        skipBtn.dataset.on = String(skip);
+        skipBtn.disabled = !on;
+        skipBtn.textContent = 'Skip';
+        skipBtn.title = skip ? 'Calls are being skipped — click to run them again' : 'Keep the tools visible but skip every call';
+
+        row.append(main, onoff, skipBtn);
+        if (srv.temporary) {
+          const rm = document.createElement('button');
+          rm.type = 'button';
+          rm.className = 'mcp-remove';
+          rm.dataset.action = 'mcp-remove';
+          rm.setAttribute('aria-label', 'Remove temporary server');
+          rm.title = 'Remove from this conversation';
+          rm.appendChild(icon(X, 14));
+          row.appendChild(rm);
+        }
+        return row;
+      }
+    }
+
+    /** X on a temporary row: drop it from the conversation (re-dials a live call). */
+    async function removeTempServer(url) {
+      tempServers = tempServers.filter((t) => t.url !== url);
+      renderMcpBar();
+      if (inCall && ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'mcp', disabled: [...mcpDisabled], skipped: [...mcpSkipped], temporary: tempServers }));
+        systemLine('Removing temporary server — Gemini is being reconnected…', 'info');
+        return;
+      }
+      if (!activeConversationId) return;
+      try {
+        const res = await fetch(`api/conversations/${activeConversationId}`, {
+          method: 'PATCH', cache: 'no-store',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mcpTemporary: tempServers }),
+        });
+        if (!res.ok) { systemLine(`Could not remove the temporary server (${res.status})`, 'error'); await refreshTempServers(); return; }
+        const conv = await res.json();
+        tempServers = Array.isArray(conv.mcpTemporary) ? conv.mcpTemporary : [];
+        renderMcpBar();
+      } catch (err) {
+        console.error('[callgemini] temporary server remove failed:', err);
+        systemLine('Could not remove the temporary server', 'error');
+        await refreshTempServers();
+      }
+    }
+
+    /**
+     * Push the toggle state where it lives: over the WS during a call (the
+     * server persists it and applies it live), via PATCH for a saved
+     * conversation that is not in a call, and nowhere for a not-yet-started
+     * chat — the start frame carries it then.
+     */
+    async function persistMcpState() {
+      const body = { mcpDisabled: [...mcpDisabled], mcpSkipped: [...mcpSkipped] };
+      if (inCall && ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'mcp', disabled: body.mcpDisabled, skipped: body.mcpSkipped }));
+        return;
+      }
+      if (!activeConversationId) return;
+      try {
+        const res = await fetch(`api/conversations/${activeConversationId}`, {
+          method: 'PATCH', cache: 'no-store',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (!res.ok) systemLine(`Could not save the MCP toggles (${res.status})`, 'error');
+      } catch (err) {
+        console.error('[callgemini] mcp state save failed:', err);
+        systemLine('Could not save the MCP toggles', 'error');
+      }
+    }
+
+    function applyConversationMcp(conv) {
+      mcpDisabled = new Set(Array.isArray(conv?.mcpDisabled) ? conv.mcpDisabled : []);
+      mcpSkipped = new Set(Array.isArray(conv?.mcpSkipped) ? conv.mcpSkipped : []);
+      tempServers = Array.isArray(conv?.mcpTemporary) ? conv.mcpTemporary : [];
+      renderMcpBar();
+    }
+
+    function resetMcpState() {
+      mcpDisabled = new Set();
+      mcpSkipped = new Set();
+      tempServers = [];
+      mcpLive.clear();
+      renderMcpBar();
+    }
 
     function relativeTime(ts) {
       if (!ts) return '';
@@ -1220,6 +1521,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
           b.textEl.textContent = t.text;
         }
         activeConversationId = id;
+        applyConversationMcp(conv);
         setStatus('idle');
         systemLine('Loaded — press Call to continue this conversation', 'info');
         closeSidebar();
@@ -1232,6 +1534,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     function newChat({ keepSidebar = false } = {}) {
       if (inCall) endCall('new-chat');
       activeConversationId = null;
+      resetMcpState(); // a fresh chat starts with every server ON
       showEmptyState();
       activeBubbles.user = null; activeBubbles.model = null; toolChips.clear();
       setStatus('idle');
@@ -1243,6 +1546,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     function unloadActiveConversation() {
       try { if (inCall) endCall('delete'); } catch (err) { console.error(err); }
       activeConversationId = null;
+      resetMcpState();
       showEmptyState();
       activeBubbles.user = null; activeBubbles.model = null; toolChips.clear();
       setStatus('idle');
@@ -1275,7 +1579,33 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
 
     els.toggleSidebarBtn?.addEventListener('click', toggleSidebar);
     els.newChatBtn?.addEventListener('click', () => newChat());
-    els.backdrop?.addEventListener('click', closeSidebar);
+    els.backdrop?.addEventListener('click', () => { closeSidebar(); closeMcpBar(); });
+    els.mcpBadge?.addEventListener('click', toggleMcpBar);
+    els.mcpbarClose?.addEventListener('click', closeMcpBar);
+    els.mcpbarInfoBtn?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      setMcpInfo(els.mcpbarInfo?.dataset.open !== 'true');
+    });
+    // Any click outside the popover (or Escape) dismisses it.
+    document.addEventListener('click', (e) => {
+      if (els.mcpbarInfo?.dataset.open === 'true' && !e.target.closest('[data-role="mcpbar-info"]')) setMcpInfo(false);
+    });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') setMcpInfo(false); });
+    els.mcpbarSettings?.addEventListener('click', () => { closeMcpBar(); openSettings(); });
+    // Delegated toggles for the runtime-rendered MCP rows.
+    els.mcpToggleList?.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-action="mcp-onoff"], [data-action="mcp-skip"], [data-action="mcp-remove"]');
+      const url = btn?.closest('.mcp-toggle-row')?.dataset.url;
+      if (!btn || !url) return;
+      if (btn.dataset.action === 'mcp-remove') { removeTempServer(url); return; }
+      if (btn.dataset.action === 'mcp-onoff') {
+        if (mcpDisabled.has(url)) mcpDisabled.delete(url); else mcpDisabled.add(url);
+        if (inCall) systemLine('Updating tools — Gemini is being reconnected…', 'info');
+      } else if (mcpSkipped.has(url)) mcpSkipped.delete(url);
+      else mcpSkipped.add(url);
+      renderMcpBar();
+      persistMcpState();
+    });
     els.convList?.addEventListener('click', (e) => {
       const item = e.target.closest('.conv-item');
       if (!item) return;
@@ -1360,7 +1690,9 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     mountIcons();
     setStatus('idle');
     updateControls();
+    renderMcpBar();
     loadConfig().then(() => {
+      renderMcpBar();
       if (!config.apiKey && !window.GEMINI_API_KEY_PRESENT) {
         systemLine('No Gemini API key set. Open Settings (⚙) to add one, or set GEMINI_API_KEY in AuraOS Context.', 'info');
       }
@@ -1409,7 +1741,78 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       background: color-mix(in srgb, var(--aura-color-bg) 55%, transparent);
       opacity: 0; pointer-events: none; transition: opacity 0.2s ease;
     }
-    .cg-app[data-sidebar="open"] .cg-backdrop { opacity: 1; pointer-events: auto; }
+    .cg-app[data-sidebar="open"] .cg-backdrop,
+    .cg-app[data-mcpbar="open"] .cg-backdrop { opacity: 1; pointer-events: auto; }
+
+    /* ── MCP servers drawer (right overlay) ─────────────────────────────── */
+    .cg-mcpbar {
+      position: absolute; top: 0; right: 0; bottom: 0; z-index: 30;
+      width: 300px; max-width: 88%;
+      display: flex; flex-direction: column; gap: 10px;
+      padding: 12px; box-sizing: border-box;
+      background: var(--aura-color-surface);
+      border-left: 1px solid var(--aura-color-border);
+      transform: translateX(100%);
+      transition: transform 0.2s ease;
+    }
+    .cg-app[data-mcpbar="open"] .cg-mcpbar { transform: translateX(0); }
+    .mcpbar-head { display: flex; align-items: center; justify-content: space-between; position: relative; }
+    .mcpbar-head-actions { display: flex; align-items: center; gap: 6px; }
+    .mcpbar-title { font-weight: 600; font-size: 14px; }
+    /* (i) popover — anchored under the header, above the list. */
+    .mcpbar-info {
+      display: none; position: absolute; top: calc(100% + 6px); left: 0; right: 0; z-index: 5;
+      padding: 10px 12px; border-radius: 10px;
+      background: var(--aura-color-surface-2); color: var(--aura-color-text-dim);
+      border: 1px solid var(--aura-color-border); box-shadow: var(--aura-glow-subtle);
+      font-size: 12px; line-height: 1.45;
+    }
+    .mcpbar-info[data-open="true"] { display: block; }
+    .mcpbar-info p { margin: 0 0 6px; }
+    .mcpbar-info p:last-child { margin-bottom: 0; }
+    .mcpbar-info strong { color: var(--aura-color-text); }
+    .mcpbar-head [aria-expanded="true"] { border-color: var(--aura-color-primary); color: var(--aura-color-primary); }
+    .mcp-toggle-list { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+    .mcp-toggle-empty { color: var(--aura-color-text-dim); font-size: 13px; text-align: center; padding: 16px 8px; }
+    .mcp-toggle-row {
+      display: flex; align-items: center; gap: 6px;
+      padding: 8px 10px; border-radius: 8px;
+      border: 1px solid var(--aura-color-border);
+      background: var(--aura-color-surface-2);
+    }
+    .mcp-toggle-row[data-on="false"] { opacity: 0.7; }
+    .mcp-toggle-main { flex: 1; min-width: 0; }
+    .mcp-toggle-name {
+      font-size: 13px; font-weight: 600;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .mcp-toggle-meta {
+      font-size: 11px; color: var(--aura-color-text-dim);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .mcp-toggle-meta[data-state="failed"] { color: var(--aura-color-danger); }
+    .mcp-toggle-meta[data-state="skipping"] { color: var(--aura-color-warning); }
+    .mcp-switch, .mcp-skip {
+      flex: 0 0 auto; font: inherit; font-size: 11px; font-weight: 700; cursor: pointer;
+      padding: 4px 10px; border-radius: 999px; line-height: 1.3;
+      border: 1px solid var(--aura-color-border);
+      background: var(--aura-color-surface); color: var(--aura-color-text-dim);
+    }
+    .mcp-switch { min-width: 42px; }
+    .mcp-group-title {
+      font-size: 11px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+      color: var(--aura-color-text-dim); margin: 6px 2px 0;
+    }
+    .mcp-toggle-row[data-temporary="true"] { border-style: dashed; }
+    .mcp-remove {
+      flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+      width: 26px; height: 26px; padding: 0; border-radius: 999px; cursor: pointer;
+      border: 1px solid var(--aura-color-border); background: transparent; color: var(--aura-color-text-dim);
+    }
+    .mcp-remove:hover { color: var(--aura-color-danger); border-color: var(--aura-color-danger); }
+    .mcp-switch[data-on="true"] { background: var(--aura-color-primary); color: var(--aura-color-bg); border-color: transparent; }
+    .mcp-skip[data-on="true"] { background: var(--aura-color-warning); color: var(--aura-color-bg); border-color: transparent; }
+    .mcp-skip:disabled { opacity: 0.4; cursor: default; }
 
     .new-chat-btn { width: 100%; text-align: left; display: flex; align-items: center; gap: 8px; }
     /* Lucide SVG icons: inherit currentColor, center inside their buttons. */
@@ -1490,6 +1893,15 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     .status-pill[data-state="error"] { background: var(--aura-color-danger); color: var(--aura-color-bg); border-color: transparent; }
 
     .cg-header-right { display: flex; align-items: center; gap: 6px; }
+    /* Header badge: enabled/total MCP servers for this conversation (opens the drawer). */
+    .mcp-pill {
+      font: inherit; font-size: 12px; font-weight: 600; cursor: pointer;
+      display: inline-flex; align-items: center; gap: 5px; line-height: 1;
+    }
+    .mcp-pill:hover { border-color: var(--aura-color-primary); color: var(--aura-color-text); }
+    .mcp-pill[data-empty="true"] { opacity: 0.6; }
+    .mcp-pill[data-skipping="true"] { border-color: var(--aura-color-warning); color: var(--aura-color-warning); }
+    .cg-app[data-mcpbar="open"] .mcp-pill { border-color: var(--aura-color-primary); color: var(--aura-color-primary); }
     /* Which speech detector is ACTUALLY driving the current call. */
     .vad-pill[data-kind="none"] { display: none; }
     .vad-pill[data-kind="silero"] { border-color: var(--aura-color-primary); color: var(--aura-color-primary); }
@@ -1553,6 +1965,13 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     .btn-ghost { background: transparent; }
     .btn-sm { padding: 6px 10px; font-size: 13px; }
     .btn-icon { padding: 9px 12px; }
+    /* Mute: icon + label; muted state is tinted so a silent mic is never missed. */
+    .mute-btn { display: inline-flex; align-items: center; gap: 7px; }
+    .mute-icon { display: inline-flex; }
+    .mute-btn[data-muted="true"]:not(:disabled) {
+      background: color-mix(in srgb, var(--aura-color-danger) 18%, transparent);
+      border-color: var(--aura-color-danger); color: var(--aura-color-danger);
+    }
 
     .call-btn {
       flex: 1; background: var(--aura-color-primary); color: var(--aura-color-bg);

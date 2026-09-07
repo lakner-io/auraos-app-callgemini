@@ -6,7 +6,13 @@
  * sessions.mjs).
  *
  * Layout under `${AURA_DATA_DIR||'/data'}/conversations/`:
- *   <id>.json   { id, title, createdAt, updatedAt, turns:[{role,text,ts}] }
+ *   <id>.json   { id, title, createdAt, updatedAt, turns:[{role,text,ts}],
+ *                 mcpDisabled:[url], mcpSkipped:[url],     (per-conversation MCP toggles)
+ *                 mcpTemporary:[{url,transport,name,addedAt,toolCount}]  (extra MCP servers for
+ *                                                           this conversation only — added/removed
+ *                                                           at runtime via the app's own MCP server)
+ *                 resumeHandle, resumeHandleAt }           (Gemini Live resumption token — lets
+ *                                                           "continue" restore the model's real context)
  *   index.json  [{ id, title, updatedAt, turnCount }]   (newest-first on read)
  *
  * Only text is stored — never audio.
@@ -53,10 +59,14 @@ async function writeJsonAtomic(file, data) {
 
 // Serialize every mutation (create/appendTurn/remove/rebuild). One process, tiny
 // throughput — a single chain is plenty and removes all read-modify-write races.
-let opChain = Promise.resolve();
+// The chain lives on globalThis: this module is instantiated twice in the
+// process (Node import for the WS bridge, Vite SSR import for the API routes —
+// see sessions.mjs), and both must queue on the SAME chain or a route write
+// can race a bridge write.
+const shared = (globalThis.__callgeminiConversations ??= { opChain: Promise.resolve() });
 function mutate(fn) {
-  const run = opChain.then(fn, fn);
-  opChain = run.then(() => undefined, () => undefined); // keep the chain alive past a rejection
+  const run = shared.opChain.then(fn, fn);
+  shared.opChain = run.then(() => undefined, () => undefined); // keep the chain alive past a rejection
   return run;
 }
 
@@ -72,11 +82,43 @@ function upsertIndexEntry(idx, conv) {
   return idx;
 }
 
+/** Per-conversation MCP toggles are lists of server URLs (the only identity a
+ * configured server has). Anything else in the input is dropped. */
+function urlList(v) {
+  if (!Array.isArray(v)) return [];
+  return [...new Set(v.filter((u) => typeof u === 'string' && u.trim()).map((u) => u.trim()))];
+}
+
+/** Temporary MCP servers: `{ url, transport, name, addedAt, toolCount }`, one
+ * per URL, http(s) only. Anything malformed is dropped. */
+export function temporaryList(v) {
+  if (!Array.isArray(v)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const e of v) {
+    const url = typeof e?.url === 'string' ? e.url.trim() : '';
+    if (!url || seen.has(url)) continue;
+    try { if (!/^https?:$/.test(new URL(url).protocol)) continue; } catch { continue; }
+    seen.add(url);
+    out.push({
+      url,
+      transport: e.transport === 'sse' ? 'sse' : 'http',
+      name: typeof e.name === 'string' && e.name.trim() ? e.name.trim().slice(0, 80) : '',
+      addedAt: Number.isFinite(e.addedAt) ? e.addedAt : Date.now(),
+      toolCount: Number.isFinite(e.toolCount) ? e.toolCount : null,
+    });
+  }
+  return out;
+}
+
 /** Create a fresh, empty conversation. */
-export async function create({ title } = {}) {
+export async function create({ title, mcpDisabled, mcpSkipped } = {}) {
   await ensureDir();
   const now = Date.now();
-  const conv = { id: randomUUID(), title: title || UNTITLED, createdAt: now, updatedAt: now, turns: [] };
+  const conv = {
+    id: randomUUID(), title: title || UNTITLED, createdAt: now, updatedAt: now, turns: [],
+    mcpDisabled: urlList(mcpDisabled), mcpSkipped: urlList(mcpSkipped), mcpTemporary: [],
+  };
   return mutate(async () => {
     await writeJsonAtomic(convFile(conv.id), conv);
     await writeJsonAtomic(INDEX_FILE, upsertIndexEntry(await loadIndex(), conv));
@@ -128,6 +170,33 @@ export async function appendTurn(id, turn) {
     }
     await writeJsonAtomic(convFile(id), conv);
     await writeJsonAtomic(INDEX_FILE, upsertIndexEntry(await loadIndex(), conv));
+    return conv;
+  });
+}
+
+/**
+ * Update per-conversation settings: the MCP toggles (`mcpDisabled` /
+ * `mcpSkipped`, arrays of server URLs), the temporary MCP servers
+ * (`mcpTemporary`) and the Gemini Live resumption handle
+ * (`resumeHandle`, string or null, stamped with `resumeHandleAt`). Only those
+ * keys are accepted. Deliberately does NOT bump `updatedAt` — none of these
+ * should reorder the conversation list. Returns the updated conversation, or
+ * null if the id is unknown.
+ */
+export async function update(id, patch = {}) {
+  await ensureDir();
+  return mutate(async () => {
+    const conv = await readJson(convFile(id), null);
+    if (!conv) return null;
+    if ('mcpDisabled' in patch) conv.mcpDisabled = urlList(patch.mcpDisabled);
+    if ('mcpSkipped' in patch) conv.mcpSkipped = urlList(patch.mcpSkipped);
+    if ('mcpTemporary' in patch) conv.mcpTemporary = temporaryList(patch.mcpTemporary);
+    if ('resumeHandle' in patch) {
+      const h = patch.resumeHandle;
+      conv.resumeHandle = typeof h === 'string' && h ? h : null;
+      conv.resumeHandleAt = conv.resumeHandle ? Date.now() : null;
+    }
+    await writeJsonAtomic(convFile(id), conv);
     return conv;
   });
 }

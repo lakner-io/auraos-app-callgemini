@@ -9,8 +9,15 @@
  * an OS-initiated stop where the browser socket didn't close first.
  */
 
-/** @type {Set<{ close: (reason?: string) => void }>} */
-const active = new Set();
+/**
+ * One Set for the whole process — anchored on globalThis ON PURPOSE. The WS
+ * bridge is loaded with a plain Node `import()` (astro.config.mjs) while the
+ * Astro API routes load this file through Vite's SSR module loader, so a bare
+ * module-scope Set would exist twice and the routes would never see the
+ * bridge's sessions.
+ * @type {Set<{ close: (reason?: string) => void }>}
+ */
+const active = (globalThis.__callgeminiSessions ??= new Set());
 
 /** Register a session so lifecycle teardown can reach it. */
 export function register(session) {
@@ -32,6 +39,18 @@ export function closeAllSessions(reason = 'os-teardown') {
     }
   }
   active.clear();
+}
+
+/** The live session recording a conversation, or null. (A conversation is
+ * recorded by at most one session at a time.) */
+export function findByConversation(convId) {
+  for (const s of active) if (s.convId && s.convId === convId && s.session) return s;
+  return null;
+}
+
+/** Conversations with a live Gemini call right now — for "which one?" hints. */
+export function liveConversations() {
+  return [...active].filter((s) => s.convId && s.session).map((s) => s.convId);
 }
 
 /** How many calls are live right now (diagnostics). */
