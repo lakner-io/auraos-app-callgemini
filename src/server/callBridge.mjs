@@ -696,18 +696,15 @@ export class CallSession {
           this.emit({ type: 'tool', name: fc.name, phase: 'done', error: response?.error });
           if (!this.session || this.session !== session) return;
           try {
-            // INTERRUPT, not WHEN_IDLE. Tools are declared NON_BLOCKING (see
-            // mcp.mjs), so Gemini keeps generating while one runs — and
-            // WHEN_IDLE only lands the result once generation stops. A model
-            // that answers a tool result with another tool call is never
-            // idle, so the results never reached it and it asked again, and
-            // again: observed as an endless get_shell_overview/get_datetime
-            // loop, with the MCP server answering every call in 1 ms. With
-            // INTERRUPT the answer lands the moment it arrives and generation
-            // continues from it. Interrupting mid-sentence is the point: the
-            // model was talking without the data it had asked for.
+            // No `scheduling`: tools are BLOCKING (see mcp.mjs), so Gemini is
+            // waiting for this and the field is ignored. It mattered while
+            // they were NON_BLOCKING, and neither value worked — WHEN_IDLE
+            // never delivered to a model that kept generating, INTERRUPT
+            // delivered but cancelled the turn that was about to emit the
+            // next call. If a tool is ever made NON_BLOCKING again, it needs
+            // a scheduling choice made with both failures in mind.
             this.session.sendToolResponse({
-              functionResponses: [{ id: fc.id, name: fc.name, response, scheduling: 'INTERRUPT' }],
+              functionResponses: [{ id: fc.id, name: fc.name, response }],
             });
           } catch (err) {
             console.error('[callgemini] sendToolResponse failed:', err?.message ?? err);

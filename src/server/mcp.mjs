@@ -7,16 +7,29 @@
  * to the owning MCP client and returns a plain `{ result }` / `{ error }` object
  * suitable for `session.sendToolResponse()`.
  *
- * Tools are declared NON_BLOCKING so Gemini keeps the conversation going while a
- * slow tool runs — the behaviour the ADK write-up wanted ("notify the user, then
- * answer when the result lands"), which the Live API supports natively.
+ * Tools are declared BLOCKING: Gemini waits for a result before continuing the
+ * conversation. They were NON_BLOCKING, so the model could keep talking while a
+ * slow tool ran, but in practice neither way of delivering the result worked:
  *
- * The price of NON_BLOCKING: Gemini issues dependent calls before the result
- * they need is back, and fills the dependent argument with the *id of the
- * pending call* ("session_id": "function-call-1812…"). `dispatchBatch()` turns
- * those placeholders back into real values — it waits for the referenced call
- * and lifts the field out of its result — so a chain like session_create →
- * navigate → snapshot → release works as the model intended.
+ *   • `scheduling: WHEN_IDLE` only lands a result once generation stops, and a
+ *     model that answers each result with another tool call never stops — it
+ *     looped over the shell MCP twenty-two times, never seeing an answer.
+ *   • `scheduling: INTERRUPT` lands it at once, but cancels whatever is being
+ *     generated — including a turn that was about to emit the next tool call.
+ *     The model said "I'll switch to workspace 5" and no call followed; the
+ *     user had to ask twice.
+ *
+ * Waiting removes both: a model that is waiting cannot loop, and nothing has to
+ * be interrupted. Several calls in one turn still run in parallel (see
+ * `dispatchBatch`), and the model can still speak before the call in the same
+ * turn — what it loses is chatting DURING a long tool. If that matters for a
+ * particular slow tool, declare that one NON_BLOCKING rather than all of them.
+ *
+ * `dispatchBatch()`'s placeholder resolution is kept for that case: under
+ * NON_BLOCKING Gemini issues dependent calls before the result they need is
+ * back and fills the argument with the *id of the pending call*
+ * ("session_id": "function-call-1812…"); it waits for the referenced call and
+ * lifts the field out of its result. Under BLOCKING it simply never triggers.
  */
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -294,7 +307,9 @@ export async function connectAll(servers = [], { skipped: initialSkipped = [], s
           name: fnName,
           description: tool.description ?? tool.title ?? tool.name,
           parameters: toParameters(tool.inputSchema),
-          behavior: 'NON_BLOCKING',
+          // See the header: NON_BLOCKING made tool calls unreliable in both
+          // delivery modes the Live API offers.
+          behavior: 'BLOCKING',
         });
       }
       serverReports.push({ url: server.url, ok: true, tools: tools.length });
