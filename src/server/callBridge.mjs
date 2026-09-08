@@ -659,6 +659,19 @@ export class CallSession {
       .catch((err) => console.error('[callgemini] appendTurn failed:', err?.message ?? err));
   }
 
+  /**
+   * Note a tool call for the repeat log. A model that asks for the same thing
+   * over and over is looping; this is what makes that visible here rather
+   * than only in the MCP server's log.
+   */
+  noteToolCall(name) {
+    const now = Date.now();
+    this.recentTools = (this.recentTools ?? []).filter((t) => now - t.at < 30_000);
+    this.recentTools.push({ name, at: now });
+    const n = this.recentTools.filter((t) => t.name === name).length;
+    if (n > 3) console.warn(`[callgemini/tool] ${name} called ${n}× in 30s — the model may be looping`);
+  }
+
   /** Route each Gemini functionCall to its MCP server; respond as each resolves. */
   handleToolCalls(functionCalls) {
     // dispatchBatch resolves placeholder args (ids of pending calls) before
@@ -671,6 +684,7 @@ export class CallSession {
     const session = this.session;
     functionCalls.forEach((fc, i) => {
       this.emit({ type: 'tool', name: fc.name, phase: 'running' });
+      this.noteToolCall(fc.name);
       console.log(`[callgemini/tool] ${fc.name} args:`, JSON.stringify(fc.args ?? {}).slice(0, 300));
       outcomes[i]
         .then((response) => {
@@ -682,8 +696,18 @@ export class CallSession {
           this.emit({ type: 'tool', name: fc.name, phase: 'done', error: response?.error });
           if (!this.session || this.session !== session) return;
           try {
+            // INTERRUPT, not WHEN_IDLE. Tools are declared NON_BLOCKING (see
+            // mcp.mjs), so Gemini keeps generating while one runs — and
+            // WHEN_IDLE only lands the result once generation stops. A model
+            // that answers a tool result with another tool call is never
+            // idle, so the results never reached it and it asked again, and
+            // again: observed as an endless get_shell_overview/get_datetime
+            // loop, with the MCP server answering every call in 1 ms. With
+            // INTERRUPT the answer lands the moment it arrives and generation
+            // continues from it. Interrupting mid-sentence is the point: the
+            // model was talking without the data it had asked for.
             this.session.sendToolResponse({
-              functionResponses: [{ id: fc.id, name: fc.name, response, scheduling: 'WHEN_IDLE' }],
+              functionResponses: [{ id: fc.id, name: fc.name, response, scheduling: 'INTERRUPT' }],
             });
           } catch (err) {
             console.error('[callgemini] sendToolResponse failed:', err?.message ?? err);
