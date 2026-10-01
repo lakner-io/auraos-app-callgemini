@@ -1,5 +1,5 @@
 /**
- * `callgemini-mcp-servers` — the MCP server CallGemini itself provides.
+ * `callgemini-mcp-servers` — CallGemini's special-purpose MCP server for its MCP servers.
  *
  * Lets another agent or app manage a conversation's TEMPORARY MCP servers:
  * list them, add one, remove one. Temporary servers are extra, per
@@ -13,20 +13,14 @@
  * (kind mcp, address /mcp/servers) — the OS Interface Registry materialises it
  * as a live address whenever this app is up.
  *
- * Built on the SDK's low-level `Server` with JSON Schema tool definitions:
- * `zod` is not resolvable from app code here (it only exists inside the SDK's
- * own dependency tree), so the `McpServer` + zod style is not an option.
+ * Call controls (speaker silence, …) live in the general control server,
+ * `mcpControl.mjs` at /mcp/control. Shared plumbing: `mcpCommon.mjs`.
  */
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import * as conversations from './conversations.mjs';
-import { findByConversation, liveConversations } from './sessions.mjs';
+import { findByConversation } from './sessions.mjs';
+import { CONVERSATION_ID_DESC, ToolError, ok, createToolServer, resolveConversation } from './mcpCommon.mjs';
 import { probeServer } from './mcp.mjs';
 import { getLastConfiguredServers } from './callBridge.mjs';
-
-const CONVERSATION_ID_DESC =
-  'Conversation to act on. Optional: defaults to the conversation of the one live call. ' +
-  'Required when no call or several calls are live (the error then lists the live conversation ids).';
 
 const TOOLS = [
   {
@@ -55,6 +49,12 @@ const TOOLS = [
       properties: {
         url: { type: 'string', description: 'MCP endpoint URL (http or https).' },
         transport: { type: 'string', enum: ['http', 'sse'], description: 'Transport; default http (Streamable HTTP).' },
+        behavior: {
+          type: 'string', enum: ['non-blocking', 'blocking'],
+          description: "Tool-call behavior. 'non-blocking' (default): a slow tool immediately answers " +
+            "\"working on it\" so the conversation continues, and the real result is announced later. " +
+            "'blocking': Gemini waits for the full result of every call.",
+        },
         name: { type: 'string', description: 'Display name shown in CallGemini (optional).' },
         conversation_id: { type: 'string', description: CONVERSATION_ID_DESC },
       },
@@ -82,19 +82,6 @@ const TOOLS = [
   },
 ];
 
-class ToolError extends Error {}
-
-/** Tool result carrying the payload as text (any client) and as structured content. */
-function ok(payload) {
-  return {
-    content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
-    structuredContent: payload,
-  };
-}
-function fail(message) {
-  return { isError: true, content: [{ type: 'text', text: message }] };
-}
-
 function normalizeUrl(raw) {
   const url = typeof raw === 'string' ? raw.trim() : '';
   if (!url) throw new ToolError('url is required.');
@@ -102,25 +89,6 @@ function normalizeUrl(raw) {
   try { parsed = new URL(url); } catch { throw new ToolError(`"${url}" is not a valid URL.`); }
   if (!/^https?:$/.test(parsed.protocol)) throw new ToolError('url must use http or https.');
   return url;
-}
-
-/** The conversation to act on: explicit id, or the single live call. */
-async function resolveConversation(conversationId) {
-  if (conversationId) {
-    const conv = await conversations.get(String(conversationId));
-    if (!conv) throw new ToolError(`No conversation with id "${conversationId}".`);
-    return conv;
-  }
-  const live = liveConversations();
-  if (live.length === 1) {
-    const conv = await conversations.get(live[0]);
-    if (conv) return conv;
-  }
-  if (live.length === 0) {
-    throw new ToolError('No call is live right now. Pass conversation_id (the id of a CallGemini conversation).');
-  }
-  const titled = await Promise.all(live.map(async (id) => ({ id, title: (await conversations.get(id))?.title ?? '' })));
-  throw new ToolError(`Several calls are live — pass conversation_id. Live: ${JSON.stringify(titled)}.`);
 }
 
 /** Write the new temporary list: through the live session when there is one
@@ -166,7 +134,8 @@ const handlers = {
     } catch (err) {
       throw new ToolError(`Could not connect to ${url} (${transport}): ${err?.message ?? err}. Nothing was added.`);
     }
-    const entry = { url, transport, name: typeof args.name === 'string' ? args.name : '', addedAt: Date.now(), toolCount: tools.length };
+    const behavior = args.behavior === 'blocking' ? 'blocking' : 'non-blocking';
+    const entry = { url, transport, behavior, name: typeof args.name === 'string' ? args.name : '', addedAt: Date.now(), toolCount: tools.length };
     const { redialed } = await commit(conv, [...current, entry]);
     return ok({ added: entry, tools, redialed, conversation: view(conv) });
   },
@@ -185,28 +154,12 @@ const handlers = {
   },
 };
 
-export function buildServer() {
-  const server = new Server(
-    { name: 'callgemini-mcp-servers', version: '1.0.0' },
-    {
-      capabilities: { tools: {} },
-      instructions:
-        "Manage the MCP servers CallGemini hands to Gemini. Servers configured in Settings apply to every " +
-        'conversation and are read-only here; temporary servers belong to one conversation and stay until ' +
-        'removed. Tools default to the conversation of the single live call; pass conversation_id otherwise.',
-    },
-  );
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
-  server.setRequestHandler(CallToolRequestSchema, async ({ params }) => {
-    const handler = handlers[params.name];
-    if (!handler) return fail(`Unknown tool: ${params.name}`);
-    try {
-      return await handler(params.arguments ?? {});
-    } catch (err) {
-      if (err instanceof ToolError) return fail(err.message);
-      console.error(`[callgemini/mcp-servers] ${params.name} failed:`, err?.message ?? err);
-      return fail(`${params.name} failed: ${err?.message ?? err}`);
-    }
-  });
-  return server;
-}
+export const buildServer = createToolServer({
+  name: 'callgemini-mcp-servers',
+  instructions:
+    "Manage the MCP servers CallGemini hands to Gemini. Servers configured in Settings apply to every " +
+    'conversation and are read-only here; temporary servers belong to one conversation and stay until ' +
+    'removed. Tools default to the conversation of the single live call; pass conversation_id otherwise.',
+  tools: TOOLS,
+  handlers,
+});

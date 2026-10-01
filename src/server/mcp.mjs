@@ -7,9 +7,10 @@
  * to the owning MCP client and returns a plain `{ result }` / `{ error }` object
  * suitable for `session.sendToolResponse()`.
  *
- * Tools are declared BLOCKING: Gemini waits for a result before continuing the
- * conversation. They were NON_BLOCKING, so the model could keep talking while a
- * slow tool ran, but in practice neither way of delivering the result worked:
+ * ── Blocking vs non-blocking servers (APP-LEVEL ASYNC) ──────────────────────
+ *
+ * Every tool is declared `behavior: 'BLOCKING'` to Gemini — the Live API's
+ * native NON_BLOCKING was tried and neither delivery mode worked:
  *
  *   • `scheduling: WHEN_IDLE` only lands a result once generation stops, and a
  *     model that answers each result with another tool call never stops — it
@@ -19,22 +20,51 @@
  *     The model said "I'll switch to workspace 5" and no call followed; the
  *     user had to ask twice.
  *
- * Waiting removes both: a model that is waiting cannot loop, and nothing has to
- * be interrupted. Several calls in one turn still run in parallel (see
- * `dispatchBatch`), and the model can still speak before the call in the same
- * turn — what it loses is chatting DURING a long tool. If that matters for a
- * particular slow tool, declare that one NON_BLOCKING rather than all of them.
+ * Instead, asynchrony is implemented at the APP level, per MCP server. Each
+ * configured server row carries `behavior: 'non-blocking' | 'blocking'`
+ * (missing ⇒ 'non-blocking'):
  *
- * `dispatchBatch()`'s placeholder resolution is kept for that case: under
- * NON_BLOCKING Gemini issues dependent calls before the result they need is
- * back and fills the argument with the *id of the pending call*
- * ("session_id": "function-call-1812…"); it waits for the referenced call and
- * lifts the field out of its result. Under BLOCKING it simply never triggers.
+ *   • 'blocking'      — Gemini waits for the full result (the old behavior).
+ *   • 'non-blocking'  — the tool promise is raced against a short timer
+ *     (NON_BLOCKING_PLACEHOLDER_MS). A fast tool responds normally; a slow one
+ *     gets an immediate `{ status:'working', … }` placeholder response so the
+ *     model can keep talking, while the real call keeps running. When it
+ *     completes, the result is handed to `onAsyncResult` (callBridge.mjs),
+ *     which injects it as a client turn at a SAFE moment — not while the user
+ *     is speaking, not mid-model-turn. That avoids both native failure modes:
+ *     nothing is interrupted, and the injected turn elicits a reply so the
+ *     result can never be starved.
+ *
+ * Dependent calls still work: `calls` records the REAL work promise (not the
+ * raced placeholder), so `resolveArgs` waits for the actual result when the
+ * model fills an argument with the *id of a pending call*
+ * ("session_id": "function-call-1812…") and lifts the field out of it.
+ *
+ * Native NON_BLOCKING survives only behind the hidden experimental config key
+ * `toolNativeNonBlocking` (no UI, default off — see callBridge.mjs): it flips
+ * non-blocking servers' declarations back to `behavior: 'NON_BLOCKING'` and
+ * disables the app-level race, for future re-tests of the Live API scheduling.
+ * Keep the two failure modes above in mind before turning it on.
  */
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
+
+/** How long a non-blocking server's tool may run before Gemini gets the
+ * "working on it" placeholder and the conversation moves on. */
+export const NON_BLOCKING_PLACEHOLDER_MS = 2500;
+
+/** The immediate response a slow tool on a non-blocking server gets. */
+export const WORKING_PLACEHOLDER = Object.freeze({
+  status: 'working',
+  note: 'Long-running — result will be announced when ready. Continue the conversation.',
+});
+
+/** Normalise a server row's behavior field; anything but 'blocking' ⇒ non-blocking. */
+export function serverBehavior(server) {
+  return server?.behavior === 'blocking' ? 'blocking' : 'non-blocking';
+}
 
 /** Gemini function names must match this; MCP names occasionally don't. */
 function sanitizeName(name) {
@@ -277,13 +307,24 @@ export async function probeServer(server, { timeoutMs = 10000 } = {}) {
  * fabricated-handle guard; pass the same one across a tool-change re-dial so
  * handles from before it stay valid.
  *
- * @param {Array<{ url: string, transport?: 'http'|'sse', name?: string }>} servers
- * @param {{ skipped?: Iterable<string>, seen?: ReturnType<typeof createSeenValues> }} [opts]
+ * `onAsyncResult({ name, response })` is called when a non-blocking tool that
+ * already got the placeholder finally completes; callBridge injects it into
+ * the conversation at a safe moment. `nativeNonBlocking` is the hidden
+ * experimental flag (see header) — it re-enables Live-API-native NON_BLOCKING
+ * declarations instead of the app-level race.
+ *
+ * @param {Array<{ url: string, transport?: 'http'|'sse', name?: string, behavior?: 'non-blocking'|'blocking' }>} servers
+ * @param {{ skipped?: Iterable<string>, seen?: ReturnType<typeof createSeenValues>, onAsyncResult?: (evt: { name: string, response: object }) => void, nativeNonBlocking?: boolean }} [opts]
  */
-export async function connectAll(servers = [], { skipped: initialSkipped = [], seen = createSeenValues() } = {}) {
+export async function connectAll(servers = [], {
+  skipped: initialSkipped = [],
+  seen = createSeenValues(),
+  onAsyncResult = null,
+  nativeNonBlocking = false,
+} = {}) {
   /** @type {Array<import('@modelcontextprotocol/sdk/client/index.js').Client>} */
   const clients = [];
-  /** @type {Map<string, { client: any, toolName: string, properties: object|null, serverUrl: string }>} */
+  /** @type {Map<string, { client: any, toolName: string, properties: object|null, serverUrl: string, behavior: 'non-blocking'|'blocking' }>} */
   const routes = new Map();
   const functionDeclarations = [];
   /** Per-server outcome, in config order — surfaced to the UI sidebar. */
@@ -298,18 +339,21 @@ export async function connectAll(servers = [], { skipped: initialSkipped = [], s
       await client.connect(makeTransport(server));
       const { tools = [] } = await client.listTools();
       clients.push(client);
+      const behavior = serverBehavior(server);
       for (const tool of tools) {
         // Keep the natural name; on collision across servers, disambiguate.
         let fnName = sanitizeName(tool.name);
         if (routes.has(fnName)) fnName = `s${i}_${fnName}`;
-        routes.set(fnName, { client, toolName: tool.name, properties: tool.inputSchema?.properties ?? null, serverUrl: server.url });
+        routes.set(fnName, { client, toolName: tool.name, properties: tool.inputSchema?.properties ?? null, serverUrl: server.url, behavior });
         functionDeclarations.push({
           name: fnName,
           description: tool.description ?? tool.title ?? tool.name,
           parameters: toParameters(tool.inputSchema),
-          // See the header: NON_BLOCKING made tool calls unreliable in both
-          // delivery modes the Live API offers.
-          behavior: 'BLOCKING',
+          // See the header: asynchrony is APP-LEVEL (placeholder + deferred
+          // injection); Gemini-native NON_BLOCKING failed in both delivery
+          // modes and stays off unless the hidden experimental
+          // `toolNativeNonBlocking` key re-enables it for a re-test.
+          behavior: nativeNonBlocking && behavior === 'non-blocking' ? 'NON_BLOCKING' : 'BLOCKING',
         });
       }
       serverReports.push({ url: server.url, ok: true, tools: tools.length });
@@ -443,6 +487,13 @@ export async function connectAll(servers = [], { skipped: initialSkipped = [], s
      * @returns {Array<Promise<{ result: string } | { error: string }>>}
      */
     dispatchBatch(fcs) {
+      // `work[i]` always settles with the REAL outcome — it feeds the
+      // placeholder-resolution `calls` map, so a dependent call waits for the
+      // actual result even after Gemini already got a placeholder.
+      // `deferreds[i]` is what the caller answers Gemini with: for a slow tool
+      // on a non-blocking server it settles early with WORKING_PLACEHOLDER
+      // while work[i] keeps running (app-level async — see the header).
+      const work = new Array(fcs.length);
       const deferreds = fcs.map(() => {
         let resolve;
         const promise = new Promise((r) => { resolve = r; });
@@ -450,7 +501,9 @@ export async function connectAll(servers = [], { skipped: initialSkipped = [], s
       });
       fcs.forEach((fc, i) => {
         if (!fc.id) return;
-        calls.set(fc.id, { name: fc.name, promise: deferreds[i].promise });
+        // The dispatch loop below is synchronous, so every work[i] exists by
+        // the first microtask — the extra .then defers the read until then.
+        calls.set(fc.id, { name: fc.name, promise: Promise.resolve().then(() => work[i]) });
         while (calls.size > CALLS_MAX) calls.delete(calls.keys().next().value);
       });
       // Queue order = issue order, except an in-batch forward reference
@@ -458,14 +511,35 @@ export async function connectAll(servers = [], { skipped: initialSkipped = [], s
       // per-server queue can never wait on something queued after it.
       for (const i of orderByDependency(fcs)) {
         const fc = fcs[i];
-        const client = routes.get(fc.name)?.client ?? null;
-        enqueue(client, async () => {
+        const route = routes.get(fc.name);
+        work[i] = enqueue(route?.client ?? null, async () => {
           let args;
           try { args = await resolveArgs(fc); } catch (err) { return { error: err.message }; }
           const fabricated = fabricatedArgError(fc, args, seen);
           if (fabricated) return { error: fabricated };
           return dispatch({ ...fc, args });
-        }).then(deferreds[i].resolve);
+        });
+        // Blocking servers, unknown tools and the native experimental mode
+        // wait for the full result — exactly the old path.
+        const raceable = route?.behavior === 'non-blocking' && !nativeNonBlocking;
+        if (!raceable) {
+          work[i].then(deferreds[i].resolve);
+          continue;
+        }
+        // Non-blocking server: placeholder after NON_BLOCKING_PLACEHOLDER_MS,
+        // real result handed to onAsyncResult for deferred injection.
+        let timedOut = false;
+        const timer = setTimeout(() => {
+          timedOut = true;
+          console.log(`[callgemini/mcp] ${fc.name} still running after ${NON_BLOCKING_PLACEHOLDER_MS}ms — answering with a working placeholder`);
+          deferreds[i].resolve({ ...WORKING_PLACEHOLDER });
+        }, NON_BLOCKING_PLACEHOLDER_MS);
+        work[i].then((response) => {
+          clearTimeout(timer);
+          if (!timedOut) { deferreds[i].resolve(response); return; }
+          try { onAsyncResult?.({ name: fc.name, response }); }
+          catch (err) { console.error('[callgemini/mcp] onAsyncResult handler failed:', err?.message ?? err); }
+        });
       }
       return deferreds.map((d) => d.promise);
     },

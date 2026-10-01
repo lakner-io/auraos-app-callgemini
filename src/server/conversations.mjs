@@ -103,6 +103,7 @@ export function temporaryList(v) {
     out.push({
       url,
       transport: e.transport === 'sse' ? 'sse' : 'http',
+      behavior: e.behavior === 'blocking' ? 'blocking' : 'non-blocking',
       name: typeof e.name === 'string' && e.name.trim() ? e.name.trim().slice(0, 80) : '',
       addedAt: Number.isFinite(e.addedAt) ? e.addedAt : Date.now(),
       toolCount: Number.isFinite(e.toolCount) ? e.toolCount : null,

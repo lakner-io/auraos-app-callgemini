@@ -40,7 +40,8 @@
 
 import { WebSocketServer } from 'ws';
 import { GoogleGenAI, Modality, StartSensitivity, EndSensitivity } from '@google/genai';
-import { connectAll, createSeenValues } from './mcp.mjs';
+import { connectAll, createSeenValues, serverBehavior } from './mcp.mjs';
+import { createShadow } from './acp.mjs';
 import { register, unregister } from './sessions.mjs';
 import * as conversations from './conversations.mjs';
 
@@ -62,12 +63,12 @@ export function mergeServers(configured, temporary) {
   for (const s of configured ?? []) {
     if (!s?.url || seen.has(s.url)) continue;
     seen.add(s.url);
-    out.push({ url: s.url, transport: s.transport ?? 'http', name: '', temporary: false });
+    out.push({ url: s.url, transport: s.transport ?? 'http', name: '', temporary: false, behavior: serverBehavior(s) });
   }
   for (const t of temporary ?? []) {
     if (!t?.url || seen.has(t.url)) continue;
     seen.add(t.url);
-    out.push({ url: t.url, transport: t.transport ?? 'http', name: t.name ?? '', temporary: true, addedAt: t.addedAt, toolCount: t.toolCount });
+    out.push({ url: t.url, transport: t.transport ?? 'http', name: t.name ?? '', temporary: true, addedAt: t.addedAt, toolCount: t.toolCount, behavior: serverBehavior(t) });
   }
   return out;
 }
@@ -86,19 +87,30 @@ const RESUME_HANDLE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 /** Persist a fresh handle at most this often (they arrive every few seconds). */
 const HANDLE_PERSIST_INTERVAL_MS = 20_000;
 
-/** Bound the history we replay when resuming so reconnect stays cheap. */
-const RESUME_MAX_TURNS = 20;
-const RESUME_MAX_CHARS = 6000;
-function capTurns(turns) {
-  const tail = turns.slice(-RESUME_MAX_TURNS);
+/** Bound the history carried into a FRESH session's system instruction. Larger
+ * than the replay cap: this is the model's only memory of earlier calls when
+ * no resumption handle can be used. Newest turns win; one huge line (a tool
+ * dump read aloud) can't crowd out the rest. */
+const HISTORY_MAX_TURNS = 60;
+const HISTORY_MAX_CHARS = 16000;
+const HISTORY_MAX_LINE = 1500;
+function historyInstruction(turns) {
+  if (!turns?.length) return '';
+  const lines = [];
   let total = 0;
-  const out = [];
-  for (let i = tail.length - 1; i >= 0; i--) {
-    total += tail[i].text.length;
-    if (total > RESUME_MAX_CHARS && out.length) break;
-    out.unshift(tail[i]);
+  for (const t of turns.slice(-HISTORY_MAX_TURNS).reverse()) {
+    const text = String(t.text ?? '').trim();
+    if (!text) continue;
+    const clipped = text.length > HISTORY_MAX_LINE ? `${text.slice(0, HISTORY_MAX_LINE)} …` : text;
+    const line = `${t.role === 'model' ? 'Assistant' : 'User'}: ${clipped}`;
+    if (total + line.length > HISTORY_MAX_CHARS && lines.length) break;
+    total += line.length;
+    lines.unshift(line);
   }
-  return out;
+  if (!lines.length) return '';
+  return '\n\n--- Conversation so far (earlier calls in this same conversation; you remember all of it. ' +
+    'Continue from here — do not greet anew or claim you lack the earlier context) ---\n' +
+    `${lines.join('\n')}\n--- end of conversation so far ---`;
 }
 
 /** Normalise a list of server URLs from the browser (dedup, strings only). */
@@ -135,6 +147,7 @@ export class CallSession {
     this.ws = ws;
     this.session = null; // Gemini Live session
     this.mcp = null;      // MCP bridge handle
+    this.shadow = null;   // ACP shadow-sync client (fire-and-forget, see acp.mjs)
     this.closed = false;
     this.convId = null;                       // conversation being recorded
     this.accrual = { role: null, text: '' };  // in-progress turn (chunks accumulate)
@@ -149,7 +162,14 @@ export class CallSession {
     this.retooling = false;                   // Gemini leg is being re-dialled for a tool change
     this.retoolChain = Promise.resolve();     // serialises retools (rapid toggles coalesce)
     this.seen = createSeenValues();           // fabricated-handle guard memory (see mcp.mjs)
+    this.pendingToolResults = [];             // late async tool results awaiting a safe injection moment
+    this.injectTimer = null;                  // retry timer while that queue waits for idle
+    this.userSpeakingUntil = 0;               // input-transcription activity + grace — "user is speaking"
+    this.toolNativeNonBlocking = false;       // hidden experimental flag (see start / mcp.mjs header)
     this.handlePersistedAt = 0;               // last time resumeHandle was written to the store
+    this.resumeUnproven = false;              // current socket was restored from a handle and hasn't completed a turn yet
+    this.speakerMuted = false;                // browser's speaker-silence state (reported by the page)
+    this.speakerWaiters = [];                 // set_speaker_muted calls awaiting the page's confirmation
     register(this);
 
     ws.on('message', (data, isBinary) => this.onClientMessage(data, isBinary));
@@ -161,6 +181,28 @@ export class CallSession {
   emit(obj) {
     if (this.closed || this.ws.readyState !== this.ws.OPEN) return;
     try { this.ws.send(JSON.stringify(obj)); } catch { /* socket gone */ }
+  }
+
+  /** The page reports its speaker-silence state (UI click, or confirming a
+   * remote set). Resolves any set_speaker_muted waiting on it. */
+  onSpeakerReport(muted) {
+    this.speakerMuted = muted;
+    const waiters = this.speakerWaiters.splice(0);
+    for (const w of waiters) w(true);
+  }
+
+  /** Silence / unsilence the speaker in the browser (output only). Waits up
+   * to `timeoutMs` for the page to confirm; never throws. */
+  setSpeakerMuted(muted, timeoutMs = 2000) {
+    return new Promise((resolve) => {
+      const done = (confirmed) => { clearTimeout(timer); resolve({ muted: this.speakerMuted, confirmed }); };
+      const timer = setTimeout(() => {
+        this.speakerWaiters = this.speakerWaiters.filter((w) => w !== done);
+        done(false);
+      }, timeoutMs);
+      this.speakerWaiters.push(done);
+      this.emit({ type: 'speaker', muted: !!muted });
+    });
   }
 
   /** Send a binary (audio) frame to the browser. */
@@ -187,7 +229,8 @@ export class CallSession {
     let msg;
     try { msg = JSON.parse(data.toString()); } catch { return; }
     switch (msg?.type) {
-      case 'start':   await this.start(msg.config ?? {}, msg.conversationId, msg.mcp); break;
+      case 'start':   this.speakerMuted = !!msg.speakerMuted; await this.start(msg.config ?? {}, msg.conversationId, msg.mcp); break;
+      case 'speaker': this.onSpeakerReport(!!msg.muted); break;
       case 'text':    this.sendText(msg.text ?? ''); break;
       case 'vad':     this.sendActivitySignal(msg.event); break;
       case 'mcp':     await this.applyMcpChange({ disabled: msg.disabled, skipped: msg.skipped, ...(Array.isArray(msg.temporary) ? { temporary: msg.temporary } : {}), why: 'ui' }); break;
@@ -220,6 +263,16 @@ export class CallSession {
     const systemInstruction = config.systemInstruction || DEFAULT_SYSTEM_INSTRUCTION;
     const silenceDurationMs = RESPONSIVENESS_MS[config.responsiveness] ?? RESPONSIVENESS_MS.balanced;
     this.seen.note(systemInstruction); // handles the user put in the instruction are theirs, not invented
+    // HIDDEN EXPERIMENTAL (no UI, default off): `toolNativeNonBlocking: true`
+    // in the stored config re-enables Gemini-native NON_BLOCKING declarations
+    // + scheduling instead of the app-level placeholder/injection path. Both
+    // native delivery modes failed before (WHEN_IDLE starved results,
+    // INTERRUPT cancelled turns — see mcp.mjs header); only flip this on to
+    // deliberately re-test the Live API.
+    this.toolNativeNonBlocking = config.toolNativeNonBlocking === true;
+    this.pendingToolResults = [];
+    this.userSpeakingUntil = 0;
+    if (this.injectTimer) { clearTimeout(this.injectTimer); this.injectTimer = null; }
 
     this.emit({ type: 'status', state: 'connecting' });
 
@@ -227,7 +280,7 @@ export class CallSession {
     // loaded the record and PATCHed any later change, and for a brand-new chat
     // it is the only copy there is.
     this.configuredServers = Array.isArray(config.mcpServers) ? config.mcpServers.filter((s) => s?.url) : [];
-    shared.lastConfiguredServers = this.configuredServers.map((s) => ({ url: s.url, transport: s.transport ?? 'http' }));
+    shared.lastConfiguredServers = this.configuredServers.map((s) => ({ url: s.url, transport: s.transport ?? 'http', behavior: serverBehavior(s) }));
     this.temporaryServers = [];
     this.mcpDisabled = new Set(urlList(mcp?.disabled));
     this.mcpSkipped = new Set(urlList(mcp?.skipped));
@@ -258,6 +311,19 @@ export class CallSession {
     }
 
     this.allServers = mergeServers(this.configuredServers, this.temporaryServers);
+
+    // ACP shadow sync (Settings → ACP address): mirror the call transcript to
+    // an ACP agent for situational awareness. Strictly fire-and-forget — a
+    // missing/broken endpoint must never touch the call.
+    if (typeof config.acpAddress === 'string' && config.acpAddress.trim()) {
+      try {
+        this.shadow?.end?.(); // a previous call on this socket may still hold one
+        this.shadow = createShadow({ address: config.acpAddress.trim(), meta: { conversationId: this.convId } });
+      } catch (err) {
+        console.warn('[callgemini/acp] shadow setup failed (ignored):', err?.message ?? err);
+        this.shadow = null;
+      }
+    }
 
     // Bridge the enabled MCP servers first so their tools are known at connect time.
     this.mcp = await this.connectMcp();
@@ -314,10 +380,7 @@ export class CallSession {
       // resumption handle from the previous call; otherwise (first call, or the
       // handle expired / was rejected) replay the transcript as text.
       const resumed = storedHandle ? await this.tryResume(storedHandle, 'continue') : false;
-      if (!resumed) {
-        await this.connectGemini();
-        this.seedTurns(priorTurns);
-      }
+      if (!resumed) await this.connectFresh(priorTurns);
     } catch (err) {
       console.error('[callgemini] live.connect failed:', err?.message ?? err);
       this.emit({ type: 'status', state: 'error', message: err?.message ?? 'Failed to connect to Gemini' });
@@ -326,20 +389,17 @@ export class CallSession {
     }
   }
 
-  /** Replay saved turns as context WITHOUT eliciting a reply
-   * (turnComplete:false) so Gemini continues where it left off once the user
-   * speaks. */
-  seedTurns(turns) {
-    if (!turns?.length || !this.session) return;
-    for (const t of turns) this.seen.note(t.text); // ids from earlier in this conversation are legitimate
-    try {
-      this.session.sendClientContent({
-        turns: capTurns(turns).map((t) => ({ role: t.role, parts: [{ text: t.text }] })),
-        turnComplete: false,
-      });
-    } catch (err) {
-      console.error('[callgemini] resume seed failed:', err?.message ?? err);
-    }
+  /** Dial a NEW Gemini session (no handle) that knows the conversation so
+   * far. The history rides in the system instruction: replaying it as client
+   * content (turnComplete:false) was silently dropped by the native-audio
+   * model once realtime audio started — the model then "had no access" to
+   * the earlier call. `this.liveConfig` stays history-free (retools reuse it). */
+  async connectFresh(turns) {
+    for (const t of turns ?? []) this.seen.note(t.text); // ids from earlier in this conversation are legitimate
+    const history = historyInstruction(turns);
+    await this.connectGemini(undefined, history
+      ? { ...this.liveConfig, systemInstruction: `${this.liveConfig.systemInstruction ?? ''}${history}` }
+      : this.liveConfig);
   }
 
   /** Servers that are ON for this conversation (config order). */
@@ -351,7 +411,14 @@ export class CallSession {
    * inert bridge so the call still starts (tools just aren't there). */
   async connectMcp() {
     try {
-      return await connectAll(this.enabledServers(), { skipped: this.mcpSkipped, seen: this.seen });
+      return await connectAll(this.enabledServers(), {
+        skipped: this.mcpSkipped,
+        seen: this.seen,
+        nativeNonBlocking: this.toolNativeNonBlocking,
+        // A non-blocking server's slow tool finished after its placeholder —
+        // queue the real result for injection at a safe moment (below).
+        onAsyncResult: (evt) => this.onAsyncToolResult(evt),
+      });
     } catch (err) {
       console.error('[callgemini] MCP connect error:', err?.message ?? err);
       return {
@@ -374,7 +441,7 @@ export class CallSession {
         const enabled = !this.mcpDisabled.has(s.url);
         const r = enabled ? live.get(s.url) : null;
         return {
-          url: s.url, transport: s.transport ?? 'http', name: s.name ?? '', temporary: !!s.temporary, enabled, skipped: this.mcpSkipped.has(s.url),
+          url: s.url, transport: s.transport ?? 'http', name: s.name ?? '', behavior: serverBehavior(s), temporary: !!s.temporary, enabled, skipped: this.mcpSkipped.has(s.url),
           ok: r ? r.ok : false, tools: r?.tools ?? 0, ...(r?.error ? { error: r.error } : {}),
           ...(s.temporary ? { addedAt: s.addedAt ?? null, toolCount: s.toolCount ?? null } : {}),
         };
@@ -464,9 +531,8 @@ export class CallSession {
       const resumed = handle ? await this.tryResume(handle, 'tool change') : false;
       if (!resumed) {
         this.resumeHandle = null;
-        await this.connectGemini(); // emits 'live'
         const turns = this.convId ? (await conversations.get(this.convId))?.turns ?? [] : [];
-        this.seedTurns(turns);
+        await this.connectFresh(turns); // emits 'live'
       }
       if (this.closed || this.userStopped) { try { this.session?.close?.(); } catch { /* noop */ } this.session = null; return; }
       console.log(`[callgemini] tools updated (${this.retoolWhy ?? 'change'}) — ${decls.length} MCP tool(s) declared${resumed ? ', context resumed' : ', transcript replayed'}`);
@@ -516,10 +582,10 @@ export class CallSession {
    * The SDK's connect() only settles on the server's setupComplete; a rejected
    * setup (bad key, bad handle, bad tool schema) arrives as a CLOSE instead, so
    * the connect is raced against it — otherwise the call would hang forever. */
-  async connectGemini(resumeHandle) {
+  async connectGemini(resumeHandle, baseConfig = this.liveConfig) {
     const config = resumeHandle
-      ? { ...this.liveConfig, sessionResumption: { handle: resumeHandle } }
-      : this.liveConfig;
+      ? { ...baseConfig, sessionResumption: { handle: resumeHandle } }
+      : baseConfig;
     // Every dial gets its own callbacks closure. A close event belongs to
     // THAT dial's socket: while it's still connecting, the close is the server
     // rejecting the setup (→ reject the pending connect); once it's live, the
@@ -562,6 +628,7 @@ export class CallSession {
       this.session = await dial(rest);
     }
     this.handlePersistedAt = 0; // persist the first handle of this socket right away
+    this.resumeUnproven = !!resumeHandle;
     // Only now is `this.session` set. Announcing 'live' from onopen (earlier)
     // let a text/vad frame sent right after 'live' hit the `!this.session`
     // guards and vanish silently.
@@ -581,6 +648,29 @@ export class CallSession {
     const reason = event?.reason ? String(event.reason) : '';
     if (code && code !== 1000 && code !== 1005) {
       console.error(`[callgemini] Gemini socket closed (code ${code})${reason ? `: ${reason}` : ''}`);
+    }
+    // A restored session can pass setup and still be rejected on first use
+    // (seen after the app died mid-call: 1007 "invalid argument" every time
+    // that conversation was continued). Drop the handle and start fresh with
+    // the transcript replayed, instead of ending the call — once.
+    if (code === 1007 && this.resumeUnproven) {
+      this.resumeUnproven = false;
+      this.resumeHandle = null;
+      console.error('[callgemini] resumed session rejected on first use — dropping handle, starting fresh');
+      this.emit({ type: 'status', state: 'reconnecting' });
+      (async () => {
+        let turns = [];
+        if (this.convId) {
+          await conversations.update(this.convId, { resumeHandle: null }).catch(() => {});
+          turns = (await conversations.get(this.convId).catch(() => null))?.turns ?? [];
+        }
+        await this.connectFresh(turns);
+      })().catch((err) => {
+        console.error('[callgemini] fresh re-dial after rejected resume failed:', err?.message ?? err);
+        this.emit({ type: 'status', state: 'error', message: `Gemini rejected the session (${code}): ${reason || 'no reason given'}` });
+        this.emit({ type: 'status', state: 'ended' });
+      });
+      return;
     }
     if (code === 1007 || code === 1008 || code === 1003) {
       this.emit({ type: 'status', state: 'error', message: `Gemini rejected the session (${code}): ${reason || 'no reason given'}` });
@@ -616,6 +706,7 @@ export class CallSession {
     const sc = message?.serverContent;
     if (sc?.inputTranscription?.text) {
       this.seen.note(sc.inputTranscription.text); // what the user said is never "invented"
+      this.userSpeakingUntil = Date.now() + 1500; // hold deferred injections while the user talks
       this.emit({ type: 'transcript', role: 'user', text: sc.inputTranscription.text });
       this.accrue('user', sc.inputTranscription.text);
     }
@@ -631,8 +722,8 @@ export class CallSession {
         else if (part?.text) { this.emit({ type: 'transcript', role: 'model', text: part.text }); this.accrue('model', part.text); }
       }
     }
-    if (sc?.interrupted) this.emit({ type: 'interrupted' });
-    if (sc?.turnComplete) { this.emit({ type: 'turnComplete' }); this.flushTurn(); }
+    if (sc?.interrupted) { this.emit({ type: 'interrupted' }); this.userSpeakingUntil = Date.now() + 1500; } // barge-in = user speaking
+    if (sc?.turnComplete) { this.resumeUnproven = false; this.emit({ type: 'turnComplete' }); this.flushTurn(); this.maybeInjectToolResults(); }
 
     if (message?.toolCall?.functionCalls?.length) {
       this.handleToolCalls(message.toolCall.functionCalls);
@@ -652,7 +743,9 @@ export class CallSession {
   flushTurn() {
     const { role, text } = this.accrual;
     this.accrual = { role: null, text: '' };
-    if (!role || !text.trim() || !this.convId) return;
+    if (!role || !text.trim()) return;
+    try { this.shadow?.pushTurn(role, text.trim()); } catch { /* never into the audio path */ }
+    if (!this.convId) return;
     const id = this.convId;
     conversations.appendTurn(id, { role, text: text.trim(), ts: Date.now() })
       .then((conv) => { if (conv) this.emit({ type: 'conversation', id, title: conv.title }); })
@@ -692,25 +785,88 @@ export class CallSession {
           // only reaches Gemini (and the transcript chip), so a failing tool is
           // invisible in the app logs.
           if (response?.error) console.error(`[callgemini/tool] ${fc.name} failed:`, String(response.error).slice(0, 300));
+          else if (response?.status === 'working') console.log(`[callgemini/tool] ${fc.name} → working placeholder (real result will be injected later)`);
           else console.log(`[callgemini/tool] ${fc.name} ok (${String(response?.result ?? '').length} chars)`);
-          this.emit({ type: 'tool', name: fc.name, phase: 'done', error: response?.error });
+          // A placeholder keeps the chip on 'running'; onAsyncToolResult
+          // flips it to 'done' when the real result lands.
+          if (response?.status !== 'working') this.emit({ type: 'tool', name: fc.name, phase: 'done', error: response?.error });
           if (!this.session || this.session !== session) return;
           try {
-            // No `scheduling`: tools are BLOCKING (see mcp.mjs), so Gemini is
-            // waiting for this and the field is ignored. It mattered while
-            // they were NON_BLOCKING, and neither value worked — WHEN_IDLE
-            // never delivered to a model that kept generating, INTERRUPT
-            // delivered but cancelled the turn that was about to emit the
-            // next call. If a tool is ever made NON_BLOCKING again, it needs
-            // a scheduling choice made with both failures in mind.
+            // Declarations are BLOCKING (see mcp.mjs): Gemini is waiting for
+            // this response — either the real result, or the app-level
+            // `working` placeholder for a slow tool on a non-blocking server
+            // (its real result is injected later at a safe moment). Only the
+            // hidden experimental native mode declares NON_BLOCKING again and
+            // then needs a `scheduling`; both known values failed before —
+            // WHEN_IDLE starved results, INTERRUPT cancelled the turn that
+            // was about to emit the next call. WHEN_IDLE is set for re-tests.
             this.session.sendToolResponse({
-              functionResponses: [{ id: fc.id, name: fc.name, response }],
+              functionResponses: [{
+                id: fc.id, name: fc.name, response,
+                ...(this.toolNativeNonBlocking ? { scheduling: 'WHEN_IDLE' } : {}),
+              }],
             });
           } catch (err) {
             console.error('[callgemini] sendToolResponse failed:', err?.message ?? err);
           }
         });
     });
+  }
+
+  /** Longest deferred tool result injected verbatim; the rest is truncated
+   * with a note (a huge result would blow the injected turn's budget). */
+  static INJECT_MAX_CHARS = 4000;
+
+  /**
+   * A non-blocking server's slow tool finished AFTER Gemini already received
+   * the `working` placeholder (mcp.mjs race). Queue the real result; it is
+   * injected as a client turn at the next safe moment.
+   */
+  onAsyncToolResult({ name, response }) {
+    const raw = response?.error ? `ERROR: ${response.error}` : String(response?.result ?? 'ok');
+    const max = CallSession.INJECT_MAX_CHARS;
+    const text = raw.length > max ? `${raw.slice(0, max)}\n…(truncated — ${raw.length} chars total)` : raw;
+    this.pendingToolResults.push({ name, text });
+    this.emit({ type: 'tool', name, phase: 'done', error: response?.error });
+    console.log(`[callgemini/tool] ${name} finished late (${raw.length} chars) — queued for injection`);
+    this.maybeInjectToolResults();
+  }
+
+  /** Safe to speak into the context: session up, no re-dial in flight, no
+   * half-accrued turn (model mid-reply, or a user turn still awaiting its
+   * reply) and no user speech within the last moment. */
+  injectionSafe() {
+    return !!this.session && !this.retooling && !this.closed &&
+      this.accrual.role === null && Date.now() >= this.userSpeakingUntil;
+  }
+
+  /**
+   * Deferred delivery of queued async tool results: all pending ones go in as
+   * user turns in ONE sendClientContent with turnComplete:true, so the model
+   * announces them. This deferral is what replaces native NON_BLOCKING
+   * scheduling (WHEN_IDLE starved results, INTERRUPT cancelled turns — see
+   * mcp.mjs). Not safe yet → retry every second until it is.
+   */
+  maybeInjectToolResults() {
+    if (!this.pendingToolResults.length) return;
+    if (this.injectTimer) { clearTimeout(this.injectTimer); this.injectTimer = null; }
+    if (!this.injectionSafe()) {
+      if (!this.closed) this.injectTimer = setTimeout(() => { this.injectTimer = null; this.maybeInjectToolResults(); }, 1000);
+      return;
+    }
+    const batch = this.pendingToolResults.splice(0);
+    for (const r of batch) this.seen.note(r.text); // handles a late result hands out are legitimate
+    try {
+      this.session.sendClientContent({
+        turns: batch.map((r) => ({ role: 'user', parts: [{ text: `[TOOL RESULT for ${r.name}]: ${r.text}` }] })),
+        turnComplete: true,
+      });
+      console.log(`[callgemini/tool] injected ${batch.length} deferred tool result(s)`);
+    } catch (err) {
+      console.error('[callgemini] deferred tool-result injection failed:', err?.message ?? err);
+      this.pendingToolResults.unshift(...batch); // keep them; retry on the next safe moment
+      if (!this.closed) this.injectTimer = setTimeout(() => { this.injectTimer = null; this.maybeInjectToolResults(); }, 1000);
+    }
   }
 
   sendText(text) {
@@ -730,12 +886,16 @@ export class CallSession {
   /** End the Gemini side of the call but keep the WS open for a new call. */
   stopGemini(_reason) {
     this.userStopped = true; // intentional — onGeminiClose must not auto-resume
+    if (this.injectTimer) { clearTimeout(this.injectTimer); this.injectTimer = null; }
+    this.pendingToolResults = []; // late results have no session to go to
     this.flushTurn(); // persist any in-progress turn before tearing down
     this.persistHandle(true); // so "continue" can pick the context back up
     try { this.session?.close?.(); } catch { /* noop */ }
     this.session = null;
     this.mcp?.close?.().catch(() => {});
     this.mcp = null;
+    try { this.shadow?.end?.(); } catch { /* noop */ }
+    this.shadow = null;
     this.emit({ type: 'status', state: 'idle' });
   }
 
@@ -743,12 +903,16 @@ export class CallSession {
   close(_reason) {
     if (this.closed) return;
     this.closed = true;
+    if (this.injectTimer) { clearTimeout(this.injectTimer); this.injectTimer = null; }
+    this.pendingToolResults = [];
     this.flushTurn(); // don't lose the last utterance on a hard socket drop
     this.persistHandle(true);
     try { this.session?.close?.(); } catch { /* noop */ }
     this.session = null;
     this.mcp?.close?.().catch(() => {});
     this.mcp = null;
+    try { this.shadow?.end?.(); } catch { /* noop */ }
+    this.shadow = null;
     try { this.ws.close(); } catch { /* noop */ }
     unregister(this);
   }

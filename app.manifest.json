@@ -2,7 +2,7 @@
   "id": "io.lakner.callgemini",
   "name": "CallGemini",
   "version": "0.1.0",
-  "description": "Voice-first chat with Gemini Live — talk, see the dialog transcribed live, and wire in your own MCP tools. Serves an MCP server to add/remove per-conversation MCP servers at runtime.",
+  "description": "Voice-first chat with Gemini Live — talk, see the dialog transcribed live, and wire in your own MCP tools. Serves an MCP server to add/remove per-conversation MCP servers at runtime, plus a control MCP server for live calls (e.g. silence the speaker).",
   "icon": "CG",
   "category": "communication",
   "instanceMode": "single",
@@ -23,6 +23,13 @@
       "address": "/mcp/servers",
       "version": "1",
       "description": "MCP server to list, add and remove a conversation's temporary MCP servers (an add/remove re-dials a live call with the new tools, context kept)."
+    },
+    {
+      "name": "control",
+      "kind": "mcp",
+      "address": "/mcp/control",
+      "version": "1",
+      "description": "General CallGemini control MCP server: read a live call's state, silence / unsilence Gemini's voice, and pause / unpause (the agent stays silent while paused) — get_call_state, set_speaker_muted, pause, unpause."
     }
   ],
   "tools": [
@@ -52,6 +59,12 @@
       "label": "Mute / unmute mic",
       "category": "Call",
       "defaultCombo": "Ctrl+Shift+M"
+    },
+    {
+      "id": "mute-speaker",
+      "label": "Silence / unsilence speaker",
+      "category": "Call",
+      "defaultCombo": "Ctrl+Shift+S"
     },
     {
       "id": "toggle-conversations",

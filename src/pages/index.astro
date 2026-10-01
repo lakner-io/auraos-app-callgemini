@@ -16,7 +16,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
   <title>CallGemini</title>
 </head>
 <body>
-  <div class="cg-app" data-role="app" data-sidebar="closed">
+  <div class="cg-app" data-role="app" data-sidebar="closed" data-view="chat">
     <!-- Conversations drawer (overlay) + backdrop -->
     <aside class="cg-sidebar" data-role="sidebar" aria-label="Conversations">
       <button class="btn new-chat-btn" data-action="new-chat" type="button"><span data-licon="plus"></span> New chat</button>
@@ -77,75 +77,194 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       <button class="btn btn-icon" data-action="settings" type="button" title="Settings" aria-label="Settings"><span data-licon="settings"></span></button>
       <button class="btn call-btn" data-action="toggle-call" data-active="false" type="button">Call</button>
       <button class="btn btn-ghost mute-btn" data-action="mute" data-muted="false" type="button" disabled title="Mute microphone" aria-label="Mute microphone" aria-pressed="false"><span class="mute-icon" data-role="mute-icon"></span><span class="mute-label" data-role="mute-label">Mute</span></button>
-    </div>
-
-    <!-- Settings modal -->
-    <div class="modal-overlay" data-role="settings-modal" data-open="false">
-      <div class="modal-panel">
-        <div class="modal-head">
-          <h2 class="modal-title">Settings</h2>
-          <button class="btn btn-icon" data-action="settings-close" type="button" aria-label="Close"><span data-licon="x"></span></button>
-        </div>
-
-        <div class="modal-body">
-        <label class="field">
-          <span class="field-label">Gemini API key</span>
-          <input class="field-input" data-field="apiKey" type="password" placeholder={hasEnvKey ? 'Using GEMINI_API_KEY from Context — override here' : 'Paste your AI Studio key'} />
-        </label>
-
-        <label class="field" data-role="model-field">
-          <span class="field-label">Model</span>
-          <select class="field-input" data-field="modelPreset"></select>
-          <input class="field-input model-custom" data-field="model" type="text" placeholder="custom model id" />
-        </label>
-
-        <label class="field">
-          <span class="field-label">Voice</span>
-          <select class="field-input" data-field="voice"></select>
-        </label>
-
-        <div class="field">
-          <span class="field-label">Languages</span>
-          <div class="lang-chips" data-role="lang-chips"></div>
-          <span class="field-hint">Tell Gemini which languages you speak so it understands you better. Any = auto-detect. Applies to your next call.</span>
-        </div>
-
-        <label class="field">
-          <span class="field-label">Noise reduction</span>
-          <select class="field-input" data-field="noiseReduction"></select>
-          <span class="field-hint">AI removes keyboard/background noise before speech detection. Applies to your next call.</span>
-        </label>
-
-        <label class="field">
-          <span class="field-label">Voice detection</span>
-          <select class="field-input" data-field="vadMode"></select>
-          <span class="field-hint">Server = Gemini detects your speech (simple). Browser = local Silero VAD signals it explicitly — fastest, downloads ~16 MB once. Applies to your next call.</span>
-        </label>
-
-        <label class="field">
-          <span class="field-label">Responsiveness</span>
-          <select class="field-input" data-field="responsiveness"></select>
-          <span class="field-hint">How soon you count as “done talking” (both detection modes). Lower = faster replies, but may cut you off mid-pause. Applies to your next call.</span>
-        </label>
-
-        <label class="field">
-          <span class="field-label">System instruction</span>
-          <textarea class="field-input" data-field="systemInstruction" rows="3" placeholder="How Gemini should behave (optional)"></textarea>
-        </label>
-
-        <div class="field">
-          <span class="field-label">MCP servers (remote HTTP / SSE)</span>
-          <div class="mcp-list" data-role="mcp-list"></div>
-          <button class="btn btn-ghost btn-sm" data-action="mcp-add" type="button">+ Add MCP server</button>
-        </div>
-        </div>
-
-        <div class="modal-foot">
-          <button class="btn btn-ghost" data-action="settings-close" type="button">Cancel</button>
-          <button class="btn call-btn" data-action="settings-save" type="button">Save</button>
-        </div>
+      <div class="vol-ctl" data-role="vol-ctl" data-overdrive="false" title="Playback volume — past 100% is overdrive">
+        <button class="vol-icon vol-mute-btn" data-action="speaker-mute" type="button" title="Silence speaker" aria-label="Silence speaker" aria-pressed="false"><span data-role="vol-icon"></span></button>
+        <input class="vol-slider" data-role="vol-slider" type="range" min="0" max="300" step="5" value="100"
+               aria-label="Playback volume (0–300%)" />
+        <span class="vol-val" data-role="vol-val">100%</span>
       </div>
     </div>
+
+    <!-- Settings view: a full-window page over the chat, NOT a separate route —
+         the call (WS, mic, AudioContexts) lives in this document and must keep
+         running while the user edits. The chat underneath is hidden via CSS. -->
+    <section class="cg-settings" data-role="settings-view" data-tab="roles" aria-label="Settings">
+      <header class="settings-head">
+        <button class="icon-btn" data-action="settings-close" type="button" aria-label="Back to chat" title="Back to chat"><span data-licon="arrow-left"></span></button>
+        <h2 class="settings-title">Settings</h2>
+        <span class="status-pill" data-role="settings-status" data-state="idle"></span>
+      </header>
+
+      <!-- Profile = the AI setup (model, voice, roles, integrations). Global
+           settings (key, audio, languages) are shared by every profile. -->
+      <div class="settings-profilebar">
+        <label class="profilebar-label" for="cg-profile-select">Profile</label>
+        <select class="field-input profile-select" id="cg-profile-select" data-field="profile"></select>
+        <div class="menu-anchor">
+          <button class="icon-btn" data-action="menu-toggle" data-menu="profile" type="button" aria-haspopup="menu" aria-expanded="false" aria-label="Profile actions" title="Profile actions"><span data-licon="ellipsis"></span></button>
+          <div class="settings-menu" data-menu-panel="profile" data-open="false" role="menu">
+            <button class="menu-item" data-action="profile-new" type="button" role="menuitem">New profile</button>
+            <button class="menu-item" data-action="profile-duplicate" type="button" role="menuitem">Duplicate</button>
+            <button class="menu-item" data-action="profile-rename" type="button" role="menuitem">Rename</button>
+            <button class="menu-item menu-item-danger" data-action="profile-delete" type="button" role="menuitem">Delete</button>
+          </div>
+        </div>
+      </div>
+      <div class="inline-bar" data-inline="profile" data-mode="none">
+        <span class="inline-bar-msg"></span>
+        <input class="field-input inline-bar-input" type="text" aria-label="Name" />
+        <button class="btn btn-ghost btn-sm" data-action="inline-cancel" type="button">Cancel</button>
+        <button class="btn btn-sm inline-bar-ok" data-action="inline-ok" type="button">OK</button>
+      </div>
+
+      <nav class="settings-tabs" role="tablist" aria-label="Settings sections">
+        <button class="settings-tab" id="cg-tab-roles" data-tab="roles" role="tab" type="button" aria-controls="cg-panel-roles">Roles</button>
+        <button class="settings-tab" id="cg-tab-model" data-tab="model" role="tab" type="button" aria-controls="cg-panel-model">Model &amp; voice</button>
+        <button class="settings-tab" id="cg-tab-integrations" data-tab="integrations" role="tab" type="button" aria-controls="cg-panel-integrations">Integrations</button>
+        <span class="settings-tabs-sep" aria-hidden="true"></span>
+        <button class="settings-tab" id="cg-tab-global" data-tab="global" role="tab" type="button" aria-controls="cg-panel-global">Global</button>
+      </nav>
+
+      <div class="settings-body">
+        <section class="settings-panel" id="cg-panel-roles" data-panel="roles" role="tabpanel" aria-labelledby="cg-tab-roles">
+          <div class="roles-layout">
+            <div class="roles-nav">
+              <div class="roles-toolbar">
+                <select class="field-input role-select" data-field="role" aria-label="Role"></select>
+                <button class="btn btn-ghost btn-sm" data-action="role-new" type="button"><span data-licon="plus"></span> Role</button>
+              </div>
+              <div class="roles-list" data-role="roles-list" aria-label="Roles"></div>
+            </div>
+
+            <div class="roles-editor">
+              <div class="inline-bar" data-inline="role" data-mode="none">
+                <span class="inline-bar-msg"></span>
+                <input class="field-input inline-bar-input" type="text" aria-label="Name" />
+                <button class="btn btn-ghost btn-sm" data-action="inline-cancel" type="button">Cancel</button>
+                <button class="btn btn-sm inline-bar-ok" data-action="inline-ok" type="button">OK</button>
+              </div>
+
+              <div class="role-empty" data-role="role-empty">
+                <p>No prompt roles in this profile — Gemini uses its default behavior.</p>
+                <button class="btn btn-sm" data-action="role-new" type="button"><span data-licon="plus"></span> New role</button>
+              </div>
+
+              <div class="role-card" data-role="role-card">
+                <div class="role-card-head">
+                  <span class="role-name" data-role="role-name"></span>
+                  <span class="badge badge-on" data-role="role-active-badge">Active</span>
+                  <button class="btn btn-ghost btn-sm" data-action="role-activate" type="button">Make active</button>
+                  <div class="menu-anchor">
+                    <button class="icon-btn" data-action="menu-toggle" data-menu="role" type="button" aria-haspopup="menu" aria-expanded="false" aria-label="Role actions" title="Role actions"><span data-licon="ellipsis"></span></button>
+                    <div class="settings-menu" data-menu-panel="role" data-open="false" role="menu">
+                      <button class="menu-item" data-action="role-rename" type="button" role="menuitem">Rename</button>
+                      <button class="menu-item" data-action="role-duplicate" type="button" role="menuitem">Duplicate</button>
+                      <button class="menu-item menu-item-danger" data-action="role-delete" type="button" role="menuitem">Delete</button>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="version-row">
+                  <label class="version-pick">
+                    <span class="field-label">Version</span>
+                    <select class="field-input version-select" data-field="version"></select>
+                  </label>
+                  <span class="badge" data-role="version-state"></span>
+                  <span class="version-actions">
+                    <button class="btn btn-ghost btn-sm" data-action="version-new" type="button"><span data-licon="copy"></span> New version</button>
+                    <button class="btn btn-sm" data-action="version-use" type="button"><span data-licon="check"></span> Use this version</button>
+                  </span>
+                </div>
+
+                <textarea class="field-input role-text" data-field="roleText" rows="12" placeholder="How Gemini should behave in this role"></textarea>
+                <span class="field-hint" data-role="version-hint"></span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="settings-panel" id="cg-panel-model" data-panel="model" role="tabpanel" aria-labelledby="cg-tab-model">
+          <label class="field" data-role="model-field">
+            <span class="field-label">Model</span>
+            <select class="field-input" data-field="modelPreset"></select>
+            <input class="field-input model-custom" data-field="model" type="text" placeholder="custom model id" />
+          </label>
+
+          <label class="field">
+            <span class="field-label">Voice</span>
+            <select class="field-input" data-field="voice"></select>
+          </label>
+        </section>
+
+        <section class="settings-panel" id="cg-panel-integrations" data-panel="integrations" role="tabpanel" aria-labelledby="cg-tab-integrations">
+          <label class="field">
+            <span class="field-label">ACP shadow address</span>
+            <input class="field-input" data-field="acpAddress" type="text" placeholder="/api/... or ws://host/path (empty = off)" />
+            <button class="btn btn-ghost btn-sm" data-action="acp-discover" type="button">Discover</button>
+            <span class="field-hint">ACP agent endpoint that silently receives the live call transcript as shadow context. Applies to your next call.</span>
+          </label>
+
+          <div class="field">
+            <span class="field-label">MCP servers (remote HTTP / SSE)</span>
+            <div class="mcp-list" data-role="mcp-list"></div>
+            <button class="btn btn-ghost btn-sm" data-action="mcp-add" type="button">+ Add MCP server</button>
+          </div>
+        </section>
+
+        <section class="settings-panel" id="cg-panel-global" data-panel="global" role="tabpanel" aria-labelledby="cg-tab-global">
+          <p class="panel-note">Shared by all profiles.</p>
+          <label class="field">
+            <span class="field-label">Gemini API key</span>
+            <input class="field-input" data-field="apiKey" type="password" placeholder={hasEnvKey ? 'Using GEMINI_API_KEY from Context — override here' : 'Paste your AI Studio key'} />
+          </label>
+
+          <div class="field">
+            <span class="field-label">Languages</span>
+            <div class="lang-chips" data-role="lang-chips"></div>
+            <span class="field-hint">Tell Gemini which languages you speak so it understands you better. Any = auto-detect. Applies to your next call.</span>
+          </div>
+
+          <label class="field">
+            <span class="field-label">Microphone</span>
+            <select class="field-input" data-field="micDevice"></select>
+          </label>
+
+          <label class="field">
+            <span class="field-label">Audio output</span>
+            <select class="field-input" data-field="outputDevice"></select>
+            <span class="field-hint">Which speaker/headset the call plays through. Applies to your next call.</span>
+          </label>
+
+          <label class="field">
+            <span class="field-label">Noise reduction</span>
+            <select class="field-input" data-field="noiseReduction"></select>
+            <span class="field-hint">AI removes keyboard/background noise before speech detection. Applies to your next call.</span>
+          </label>
+
+          <label class="field">
+            <span class="field-label">Voice detection</span>
+            <select class="field-input" data-field="vadMode"></select>
+            <span class="field-hint">Server = Gemini detects your speech (simple). Browser = local Silero VAD signals it explicitly — fastest, downloads ~16 MB once. Applies to your next call.</span>
+          </label>
+
+          <label class="field">
+            <span class="field-label">Responsiveness</span>
+            <select class="field-input" data-field="responsiveness"></select>
+            <span class="field-hint">How soon you count as “done talking” (both detection modes). Lower = faster replies, but may cut you off mid-pause. Applies to your next call.</span>
+          </label>
+        </section>
+      </div>
+
+      <!-- Leaving with unsaved edits flips the footer into a discard prompt
+           instead of silently dropping them (iframes may block confirm()). -->
+      <footer class="settings-foot" data-confirm="false">
+        <span class="settings-foot-msg">Discard unsaved changes?</span>
+        <button class="btn btn-ghost" data-action="settings-close" type="button">Cancel</button>
+        <button class="btn call-btn" data-action="settings-save" type="button">Save</button>
+        <button class="btn btn-ghost" data-action="settings-keep" type="button">Keep editing</button>
+        <button class="btn btn-danger" data-action="settings-discard" type="button">Discard</button>
+      </footer>
+    </section>
   </div>
 
   <script define:vars={{ hasEnvKey }} is:inline>
@@ -157,10 +276,11 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     // 24 kHz PCM playback, live transcript rendering, tool chips, settings, and
     // config persistence. Elements are found by data-* hooks, styled by class;
     // transcript rows are created here at runtime.
-    import { createElement as lucideEl, Menu, Settings, X, Trash2, Plus, Plug, Mic, MicOff, Info } from 'lucide';
+    import { createElement as lucideEl, Menu, Settings, X, Trash2, Plus, Plug, Mic, MicOff, Info, Volume2, VolumeX, ArrowLeft, Ellipsis, Copy, Check } from 'lucide';
+    import { createCallAudio } from '../client/callAudio.mjs';
 
     // Lucide SVG icons (stroke=currentColor → inherit the button's theme color).
-    const LUCIDE = { menu: Menu, settings: Settings, x: X, 'trash-2': Trash2, plus: Plus, plug: Plug, mic: Mic, 'mic-off': MicOff, info: Info };
+    const LUCIDE = { menu: Menu, settings: Settings, x: X, 'trash-2': Trash2, plus: Plus, plug: Plug, mic: Mic, 'mic-off': MicOff, info: Info, 'volume-2': Volume2, 'volume-x': VolumeX, 'arrow-left': ArrowLeft, ellipsis: Ellipsis, copy: Copy, check: Check };
     function icon(node, size = 18) {
       const el = lucideEl(node);
       el.setAttribute('width', String(size));
@@ -185,9 +305,13 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       systemInstruction: '',
       responsiveness: 'balanced', // snappy | balanced | relaxed — end-of-speech window
       vadMode: 'server',          // 'server' (automatic detection) | 'browser' (local Silero VAD)
+      volume: 100,                // playback volume %, up to 300 (overdrive past 100)
       noiseReduction: 'ai',       // 'ai' (RNNoise + browser filters) | 'browser' (filters only)
+      micDeviceId: '',            // '' = system default input
+      outputDeviceId: '',         // '' = system default output
       languages: [],              // BCP-47 hints for input understanding; [] = auto-detect
-      mcpServers: [],
+      acpAddress: '',             // ACP endpoint for shadow transcript sync; '' = off
+      mcpServers: [],             // [{ url, transport, behavior? }] — behavior 'non-blocking' (default) | 'blocking'
     };
     // BCP-47 language hints — German & English first, then popular ones.
     const LANGUAGES = [
@@ -228,6 +352,141 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     ];
     const VOICES = ['Puck', 'Charon', 'Kore', 'Fenrir', 'Aoede', 'Leda', 'Orus', 'Zephyr'];
 
+    // ── settings-store:begin ────────────────────────────────────────────────
+    // Pure settings model (no DOM) — kept between these markers so a test can
+    // extract and exercise it. KV value, schema 2:
+    //   { schema: 2, global: {apiKey, audio…, languages}, activeProfileId,
+    //     profiles: [{ id, name, model, voiceName, acpAddress, mcpServers,
+    //                  activeRoleId, roles: [{ id, name, activeVersion,
+    //                  versions: [{ n, text, createdAt }] }] }] }
+    // A call still receives the flat `config` shape (resolveConfig), so the
+    // server side is unchanged. Only the highest version n is editable.
+    const PROFILE_KEYS = ['model', 'voiceName', 'acpAddress', 'mcpServers'];
+
+    function uid(prefix) {
+      try { return `${prefix}_${crypto.randomUUID()}`; }
+      catch { return `${prefix}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`; }
+    }
+
+    function blankProfile(name, defaults) {
+      return {
+        id: uid('p'), name,
+        model: defaults.model, voiceName: defaults.voiceName, acpAddress: '', mcpServers: [],
+        activeRoleId: null, roles: [],
+      };
+    }
+
+    function newRole(name, text = '') {
+      return { id: uid('r'), name, activeVersion: 1, versions: [{ n: 1, text, createdAt: Date.now() }] };
+    }
+
+    const latestN = (role) => role.versions.reduce((m, v) => Math.max(m, v.n), 0);
+    const versionOf = (role, n) => role.versions.find((v) => v.n === n) ?? null;
+    const isFrozen = (role, n) => n !== latestN(role);
+    const activeProfile = (store) => store.profiles.find((p) => p.id === store.activeProfileId) ?? store.profiles[0];
+    const activeRole = (profile) => profile.roles.find((r) => r.id === profile.activeRoleId) ?? null;
+
+    /** Copy `fromN`'s text (default: latest) into a new latest version; returns its n. */
+    function addVersion(role, fromN) {
+      const src = versionOf(role, fromN) ?? versionOf(role, latestN(role));
+      const n = latestN(role) + 1;
+      role.versions.push({ n, text: src?.text ?? '', createdAt: Date.now() });
+      return n;
+    }
+
+    /** Deep copy with fresh ids (the active role follows its copy). */
+    function duplicateProfile(profile, name) {
+      const copy = JSON.parse(JSON.stringify(profile));
+      copy.id = uid('p');
+      copy.name = name;
+      for (const r of copy.roles) {
+        const fresh = uid('r');
+        if (copy.activeRoleId === r.id) copy.activeRoleId = fresh;
+        r.id = fresh;
+      }
+      return copy;
+    }
+
+    /** `base`, or `base 2`, `base 3`… — whichever is not taken. */
+    function uniqueName(base, taken) {
+      const names = new Set(taken);
+      if (!names.has(base)) return base;
+      for (let i = 2; ; i += 1) if (!names.has(`${base} ${i}`)) return `${base} ${i}`;
+    }
+
+    /** Any stored value (schema 2, the old flat config, or nothing) → a valid schema-2 store. */
+    function migrateStore(value, defaults) {
+      const globalDefaults = { ...defaults };
+      for (const k of [...PROFILE_KEYS, 'systemInstruction']) delete globalDefaults[k];
+      const obj = value && typeof value === 'object' ? value : {};
+
+      if (obj.schema === 2 && Array.isArray(obj.profiles) && obj.profiles.length) {
+        const store = JSON.parse(JSON.stringify(obj));
+        store.global = { ...globalDefaults, ...(store.global ?? {}) };
+        for (const p of store.profiles) {
+          p.roles = (Array.isArray(p.roles) ? p.roles : []).filter((r) => Array.isArray(r?.versions) && r.versions.length);
+          for (const r of p.roles) if (!versionOf(r, r.activeVersion)) r.activeVersion = latestN(r);
+          if (!p.roles.some((r) => r.id === p.activeRoleId)) p.activeRoleId = p.roles[0]?.id ?? null;
+          if (!Array.isArray(p.mcpServers)) p.mcpServers = [];
+        }
+        if (!store.profiles.some((p) => p.id === store.activeProfileId)) store.activeProfileId = store.profiles[0].id;
+        return store;
+      }
+
+      // Old flat config: profile fields → "Default" profile, the rest stays global
+      // (unknown keys too — they keep reaching the call through resolveConfig).
+      const flat = { ...defaults, ...obj };
+      const { systemInstruction, model, voiceName, acpAddress, mcpServers, schema, ...global } = flat;
+      const profile = {
+        ...blankProfile('Default', defaults),
+        model: model || defaults.model,
+        voiceName: voiceName || defaults.voiceName,
+        acpAddress: acpAddress ?? '',
+        mcpServers: Array.isArray(mcpServers) ? mcpServers : [],
+      };
+      if (typeof systemInstruction === 'string' && systemInstruction.trim()) {
+        const role = newRole('Default', systemInstruction);
+        profile.roles.push(role);
+        profile.activeRoleId = role.id;
+      }
+      return { schema: 2, global: { ...globalDefaults, ...global }, activeProfileId: profile.id, profiles: [profile] };
+    }
+
+    /** The flat config a call uses: global + active profile + active role's in-use version. */
+    function resolveConfig(store, defaults) {
+      const p = activeProfile(store);
+      const r = activeRole(p);
+      const v = r && (versionOf(r, r.activeVersion) ?? versionOf(r, latestN(r)));
+      return {
+        ...defaults,
+        ...store.global,
+        model: p.model || defaults.model,
+        voiceName: p.voiceName || defaults.voiceName,
+        acpAddress: p.acpAddress ?? '',
+        mcpServers: Array.isArray(p.mcpServers) ? p.mcpServers : [],
+        systemInstruction: v?.text ?? '',
+      };
+    }
+
+    /** Stable serialization for "are there unsaved changes?" (key order, trims, defaults). */
+    function canonicalStore(store) {
+      const g = store.global ?? {};
+      return JSON.stringify({
+        global: Object.keys(g).sort().map((k) => [k,
+          k === 'languages' ? [...(g[k] ?? [])].sort()
+            : typeof g[k] === 'string' ? g[k].trim() : g[k]]),
+        active: store.activeProfileId,
+        profiles: store.profiles.map((p) => [
+          p.id, p.name, p.model, p.voiceName, (p.acpAddress ?? '').trim(), p.activeRoleId,
+          (p.mcpServers ?? []).filter((m) => m?.url).map((m) => [
+            m.url.trim(), m.transport ?? 'http', m.behavior === 'blocking' ? 'blocking' : 'non-blocking',
+          ]),
+          p.roles.map((r) => [r.id, r.name, r.activeVersion, r.versions.map((v) => [v.n, (v.text ?? '').trim()])]),
+        ]),
+      });
+    }
+    // ── settings-store:end ──────────────────────────────────────────────────
+
     const $ = (sel, root = document) => root.querySelector(sel);
 
     const els = {
@@ -250,32 +509,62 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       transcript: $('[data-role="transcript"]'),
       callBtn: $('[data-action="toggle-call"]'),
       muteBtn: $('[data-action="mute"]'),
+      volCtl: $('[data-role="vol-ctl"]'),
+      volSlider: $('[data-role="vol-slider"]'),
+      volVal: $('[data-role="vol-val"]'),
+      speakerBtn: $('[data-action="speaker-mute"]'),
+      volIconSlot: $('[data-role="vol-icon"]'),
       muteIcon: $('[data-role="mute-icon"]'),
       muteLabel: $('[data-role="mute-label"]'),
       settingsBtn: $('[data-action="settings"]'),
       textForm: $('[data-form="text"]'),
       textInput: $('[data-role="text-input"]'),
-      modal: $('[data-role="settings-modal"]'),
+      settingsView: $('[data-role="settings-view"]'),
+      settingsStatus: $('[data-role="settings-status"]'),
+      settingsFoot: $('.settings-foot'),
       fApiKey: $('[data-field="apiKey"]'),
       fModel: $('[data-field="model"]'),
       fModelPreset: $('[data-field="modelPreset"]'),
       modelField: $('[data-role="model-field"]'),
       fVoice: $('[data-field="voice"]'),
+      fMicDevice: $('[data-field="micDevice"]'),
+      fOutputDevice: $('[data-field="outputDevice"]'),
       fVadMode: $('[data-field="vadMode"]'),
       fNoise: $('[data-field="noiseReduction"]'),
       langChips: $('[data-role="lang-chips"]'),
       fResponsiveness: $('[data-field="responsiveness"]'),
-      fSystem: $('[data-field="systemInstruction"]'),
+      profileSelect: $('[data-field="profile"]'),
+      roleSelect: $('[data-field="role"]'),
+      rolesList: $('[data-role="roles-list"]'),
+      roleEmpty: $('[data-role="role-empty"]'),
+      roleCard: $('[data-role="role-card"]'),
+      roleName: $('[data-role="role-name"]'),
+      roleActiveBadge: $('[data-role="role-active-badge"]'),
+      roleActivate: $('[data-action="role-activate"]'),
+      versionSelect: $('[data-field="version"]'),
+      versionState: $('[data-role="version-state"]'),
+      versionHint: $('[data-role="version-hint"]'),
+      versionUse: $('[data-action="version-use"]'),
+      fRoleText: $('[data-field="roleText"]'),
+      settingsTabs: $('.settings-tabs'),
+      fAcpAddress: $('[data-field="acpAddress"]'),
+      acpDiscover: $('[data-action="acp-discover"]'),
       mcpList: $('[data-role="mcp-list"]'),
       mcpAdd: $('[data-action="mcp-add"]'),
       settingsSave: $('[data-action="settings-save"]'),
-      settingsClose: $('[data-action="settings-close"]'),
     };
 
-    let config = { ...DEFAULTS };
+    // `store` (profiles, roles, versions — see settings-store) is the source of
+    // truth; `config` is its resolved flat view, which is what a call sends.
+    let store = migrateStore(null, DEFAULTS);
+    let config = resolveConfig(store, DEFAULTS);
+    let pendingV1Backup = null; // old flat config, copied aside before the first schema-2 write
     let ws = null;
     let inCall = false;
     let muted = false;
+    // Speaker silenced (playback gain 0, config.volume untouched so unsilence
+    // restores it). Page-lifetime only: survives calls, not a reload.
+    let speakerMuted = false;
     let activeConversationId = null; // null = new chat; set → resume on next call
     // Per-conversation MCP toggles (server URLs). Empty = all ON, nothing skipped.
     let mcpDisabled = new Set();
@@ -289,9 +578,14 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     let convRefreshTimer = null;
     let captureCtx = null;
     let captureStream = null;
+    let callAudio = null;
     let playbackCtx = null;
     let playbackNode = null;
     let playbackGain = null; // fade stage for soft barge-in
+    let volumeGain = null;   // user volume incl. overdrive (>1), limiter behind it
+    let volSaveTimer = 0;    // debounce for persisting slider drags
+    let underrunNoted = false; // one jitter systemLine per call, not per underrun
+    let vadFailStreak = 0;     // consecutive VAD inference failures → live fallback
     let playbackEl = null;   // hidden <audio> sink — see startPlayback (AEC)
     let fading = false;      // softInterrupt re-entrancy guard
     let userLevel = 0;       // live RMS of mic / model audio → button glow
@@ -307,17 +601,29 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
         const res = await fetch(KV_URL);
         if (res.ok) {
           const { value } = await res.json();
-          if (value && typeof value === 'object') config = { ...DEFAULTS, ...value };
+          if (value && typeof value === 'object' && value.schema !== 2) pendingV1Backup = value;
+          store = migrateStore(value, DEFAULTS);
+          config = resolveConfig(store, DEFAULTS);
         }
       } catch { /* first run / offline — keep defaults */ }
     }
 
     async function saveConfig() {
       try {
+        if (pendingV1Backup) {
+          // One-time safety net: keep the pre-profiles config restorable.
+          const backup = await fetch(`${KV_URL}-v1-backup`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ value: pendingV1Backup }),
+          });
+          if (!backup.ok) { console.error('[callgemini] v1 backup failed:', backup.status); return false; }
+          pendingV1Backup = null;
+        }
         const res = await fetch(KV_URL, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ value: config }),
+          body: JSON.stringify({ value: store }),
         });
         if (!res.ok) { console.error('[callgemini] config save failed:', res.status); return false; }
         return true;
@@ -333,9 +639,12 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     };
 
     function setStatus(state, message) {
-      if (els.status) {
-        els.status.dataset.state = state;
-        els.status.textContent = message ? `${STATUS_LABEL[state] ?? state} · ${message}` : (STATUS_LABEL[state] ?? state);
+      const text = message ? `${STATUS_LABEL[state] ?? state} · ${message}` : (STATUS_LABEL[state] ?? state);
+      // The settings header mirrors the pill so a live call stays visible.
+      for (const pill of [els.status, els.settingsStatus]) {
+        if (!pill) continue;
+        pill.dataset.state = state;
+        pill.textContent = text;
       }
     }
 
@@ -373,13 +682,35 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       return { row, textEl: txt };
     }
 
+    // Transcript batching: transcript WS events arrive many times per second
+    // while Gemini speaks, and each DOM append + scrollHeight read forces a
+    // reflow on the same thread that feeds the playback worklet. Coalesce all
+    // text into one DOM write + one scroll per animation frame.
+    const pendingText = { user: '', model: '' };
+    let transcriptRaf = 0;
+
+    function flushTranscript() {
+      transcriptRaf = 0;
+      let wrote = false;
+      for (const role of ['user', 'model']) {
+        if (!pendingText[role]) continue;
+        if (!activeBubbles[role]) activeBubbles[role] = createBubble(role);
+        activeBubbles[role].textEl.textContent += pendingText[role];
+        pendingText[role] = '';
+        wrote = true;
+      }
+      if (wrote) scrollDown();
+    }
+
     function appendTranscript(role, text) {
-      if (!activeBubbles[role]) activeBubbles[role] = createBubble(role);
-      activeBubbles[role].textEl.textContent += text;
-      scrollDown();
+      pendingText[role] += text;
+      if (!transcriptRaf) transcriptRaf = requestAnimationFrame(flushTranscript);
     }
 
     function finalizeTurn() {
+      // Land any batched text in the CURRENT bubbles before closing them.
+      if (transcriptRaf) cancelAnimationFrame(transcriptRaf);
+      flushTranscript();
       activeBubbles.user = null;
       activeBubbles.model = null;
     }
@@ -427,7 +758,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
         // a network drop, not a hang-up (endCall flips inCall to false BEFORE
         // its socket close fires) — try to resume instead of dying.
         sock.addEventListener('close', () => {
-          if (!inCall || wsReconnecting) return;
+          if (!inCall || wsReconnecting || ws !== sock) return;
           reconnectWs();
         });
       });
@@ -439,6 +770,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
         config: { ...config, vadMode: vadEngineKind ? 'browser' : 'server' },
         conversationId: activeConversationId,
         mcp: { disabled: [...mcpDisabled], skipped: [...mcpSkipped] },
+        speakerMuted,
       });
     }
 
@@ -499,13 +831,17 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
           updateActiveConvHighlight();
           scheduleConvRefresh();
           break;
+        case 'speaker':
+          // Silence/unsilence from the app's MCP server (set_speaker_muted).
+          setSpeakerMuted(!!msg.muted);
+          break;
         case 'mcp':
           // Where every server stands on the server side right now — and the
           // authoritative temporary list (another app may have just added one).
           mcpLive.clear();
           for (const srv of msg.servers ?? []) mcpLive.set(srv.url, srv);
           tempServers = (msg.servers ?? []).filter((s) => s.temporary)
-            .map((s) => ({ url: s.url, transport: s.transport ?? 'http', name: s.name ?? '', addedAt: s.addedAt ?? null, toolCount: s.toolCount ?? null }));
+            .map((s) => ({ url: s.url, transport: s.transport ?? 'http', name: s.name ?? '', behavior: s.behavior === 'blocking' ? 'blocking' : 'non-blocking', addedAt: s.addedAt ?? null, toolCount: s.toolCount ?? null }));
           renderMcpBar();
           break;
         default:
@@ -579,55 +915,113 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       };
     }
 
-    /**
-     * Bring up the best available local VAD: Silero (wasm) → energy fallback.
-     * Never throws — worst case is the dependency-free energy tier. Each Silero
-     * stage is labelled so a device failure (e.g. Android WebView without wasm
-     * SIMD) reports exactly WHY instead of a blind generic message.
-     */
-    async function initBrowserVad() {
-      if (vadEngine) { vadEngine.resetState(); return vadEngine; }
+    /** The shell proxy serves everything with `cache-control: no-store`, so
+     * the browser would re-download the ~16 MB VAD assets on EVERY page load.
+     * CacheStorage ignores response cache headers → one download per device.
+     * Plain fetch on insecure contexts (no `caches`) or storage errors. */
+    async function cachedFetch(url) {
+      try {
+        const cache = await caches.open('callgemini-vad-v1');
+        const hit = await cache.match(url);
+        if (hit) return hit;
+        const res = await fetch(url);
+        if (res.ok) { try { await cache.put(url, res.clone()); } catch { /* quota — serve uncached */ } }
+        return res;
+      } catch {
+        return fetch(url);
+      }
+    }
+
+    let energyEngine = null;   // cached dependency-free fallback tier
+    let sileroReady = null;    // the Silero engine once (and only once) it's up
+    let sileroWarm = null;     // in-flight warm-up (singleton, never rejects)
+
+    /** The actual Silero bring-up. Each stage is labelled so a device failure
+     * (e.g. Android WebView without wasm SIMD) reports exactly WHY. Throws —
+     * callers go through warmSilero(), which converts failure to null. */
+    async function loadSilero() {
       let stage = 'wasm SIMD check';
       try {
         if (typeof WebAssembly === 'undefined' || !WebAssembly.validate(SIMD_TEST)) {
           throw new Error('this WebView has no WebAssembly SIMD support');
         }
         stage = 'load onnxruntime';
-        const ort = await import('onnxruntime-web');
+        // Self-hosted ort module (copied from onnxruntime-web/dist into
+        // public/vad/ort/): the Vite dep-optimized import breaks whenever the
+        // dev server restarts while a page is already open (the ?v= hash
+        // rotates → "Failed to fetch dynamically imported module" on the
+        // tablet). A static asset URL is stable across restarts. Fall back to
+        // the bare import if the asset is missing.
+        let ort;
+        try {
+          ort = await import(/* @vite-ignore */ new URL('vad/ort/ort.wasm.bundle.min.mjs', document.baseURI).href);
+        } catch (e) {
+          console.warn('[callgemini] self-hosted ort import failed, trying dep-optimized:', e?.message ?? e);
+          ort = await import('onnxruntime-web');
+        }
         ort.env.wasm.numThreads = 1; // no SharedArrayBuffer without cross-origin isolation
         // Explicit absolute mjs URL + prefetched wasm binary: sidesteps the two
         // other WebView failure modes (loader path resolution relative to the
         // ort module, and wasm MIME/streaming-compile strictness).
         ort.env.wasm.wasmPaths = { mjs: new URL('vad/ort/ort-wasm-simd-threaded.mjs', document.baseURI).href };
         stage = 'fetch wasm runtime';
-        const wasmRes = await fetch('vad/ort/ort-wasm-simd-threaded.wasm');
+        const wasmRes = await cachedFetch('vad/ort/ort-wasm-simd-threaded.wasm');
         if (!wasmRes.ok) throw new Error(`HTTP ${wasmRes.status}`);
         ort.env.wasm.wasmBinary = await wasmRes.arrayBuffer();
         stage = 'fetch silero model';
-        const modelRes = await fetch('vad/silero_vad_v5.onnx');
+        const modelRes = await cachedFetch('vad/silero_vad_v5.onnx');
         if (!modelRes.ok) throw new Error(`HTTP ${modelRes.status}`);
         const model = await modelRes.arrayBuffer();
         stage = 'create session';
-        const session = await ort.InferenceSession.create(model);
-        const sr = new ort.Tensor('int64', [16000n]);
-        let state = new ort.Tensor('float32', new Float32Array(2 * 128), [2, 1, 128]);
-        vadEngine = {
+        // Prefer inference in ort's proxy worker: VAD windows run every 32 ms
+        // DURING playback, and on weak devices main-thread wasm competes with
+        // feeding the playback worklet (audible as cuts). Proxy failure (some
+        // WebViews) falls back to the main-thread session — correct, just
+        // heavier.
+        let session;
+        try {
+          ort.env.wasm.proxy = true;
+          session = await ort.InferenceSession.create(model);
+        } catch (proxyErr) {
+          console.warn('[callgemini] ort proxy worker unavailable, running VAD on main thread:', proxyErr?.message ?? proxyErr);
+          ort.env.wasm.proxy = false;
+          session = await ort.InferenceSession.create(model);
+        }
+        // IMPORTANT: in proxy mode session.run() TRANSFERS each tensor's
+        // ArrayBuffer to the worker, detaching it — a reused tensor throws
+        // DataCloneError on the second call and kills the VAD (and with it
+        // the whole call). Build every tensor fresh per inference; only the
+        // recurrent state DATA survives between calls, copied out each run.
+        let stateData = new Float32Array(2 * 128);
+        return {
           kind: 'silero',
-          resetState() { state = new ort.Tensor('float32', new Float32Array(2 * 128), [2, 1, 128]); },
+          resetState() { stateData = new Float32Array(2 * 128); },
           async prob(window512) {
             const input = new ort.Tensor('float32', window512, [1, VAD_WINDOW]);
+            const state = new ort.Tensor('float32', stateData, [2, 1, 128]);
+            const sr = new ort.Tensor('int64', [16000n]);
             const out = await session.run({ input, state, sr });
-            state = out.stateN;
+            stateData = new Float32Array(out.stateN.data);
             return out.output.data[0];
           },
         };
-        return vadEngine;
       } catch (err) {
         console.error(`[callgemini] Silero VAD init failed at "${stage}":`, err);
         systemLine(`Silero VAD unavailable (${stage}: ${err?.message ?? err}) — using energy-based detection.`, 'info');
-        vadEngine = createEnergyVad();
-        return vadEngine;
+        throw err;
       }
+    }
+
+    /** Kick off (or join) the Silero warm-up. Resolves to the engine, or null
+     * if this device can't run it — never rejects, and never blocks a call:
+     * startCall dials with the energy tier and hot-swaps when this lands. */
+    function warmSilero() {
+      if (!sileroWarm) {
+        sileroWarm = loadSilero()
+          .then((engine) => { sileroReady = engine; return engine; })
+          .catch(() => null);
+      }
+      return sileroWarm;
     }
 
     function resetVadCallState() {
@@ -711,8 +1105,21 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
         vadAccum = vadAccum.slice(VAD_WINDOW);
         vadBusy = true;
         engine.prob(window512)
-          .then((p) => onProb(p, (VAD_WINDOW / 16000) * 1000))
-          .catch((err) => console.error('[callgemini] vad inference failed:', err))
+          .then((p) => { vadFailStreak = 0; onProb(p, (VAD_WINDOW / 16000) * 1000); })
+          .catch((err) => {
+            console.error('[callgemini] vad inference failed:', err);
+            // A persistently failing detector DEAFENS the call (no speech
+            // starts → nothing streams to Gemini). After a short failure
+            // streak on the Silero tier, swap to the energy tier live.
+            if (engine === vadEngine && vadEngineKind === 'silero' && ++vadFailStreak >= 5) {
+              vadFailStreak = 0;
+              vadEngine = (energyEngine ??= createEnergyVad());
+              vadEngine.resetState();
+              vadEngineKind = 'energy';
+              setVadBadge('energy');
+              systemLine('Silero VAD failed mid-call — switched to energy detection.', 'error');
+            }
+          })
           .finally(() => { vadBusy = false; });
       }
     }
@@ -735,6 +1142,10 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
         userLevel = Math.sqrt(sum / (n || 1));
       }
 
+      // Capture is verified before dialing. Do not advance VAD state until
+      // there is a socket to receive its activity signals.
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
       if (vadEngineKind === null) {
         // Server-VAD mode. Normally stream continuously — but while Gemini's
         // audio is audible, gate the mic so it can't hear itself. The energy
@@ -756,37 +1167,45 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       feedDetector(buf, vadEngine, onVadProb);
     }
 
-    async function startCapture() {
-      captureStream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      });
-      captureCtx = new AudioContext();
+    async function startCapture(audio) {
+      const stream = await audio.microphone();
+      audio.assertActive();
+      captureStream = stream;
+      const context = audio.context;
 
       // Noise reduction 'ai' loads the RNNoise variant of the capture worklet
       // (a separate module so calls without it never download the ~2 MB wasm).
       // Any load failure falls back to the plain worklet — never break capture.
       let processorName = 'capture-worklet';
-      if ((config.noiseReduction ?? DEFAULTS.noiseReduction) === 'ai') {
+      if ((config.noiseReduction ?? DEFAULTS.noiseReduction) === 'ai' && context.sampleRate === 48000) {
         try {
-          await captureCtx.audioWorklet.addModule('worklets/capture-denoise-worklet.js');
+          await context.audioWorklet.addModule('worklets/capture-denoise-worklet.js');
+          audio.assertActive();
           processorName = 'capture-worklet-denoise';
         } catch (err) {
+          audio.assertActive();
           console.error('[callgemini] denoise worklet failed to load, using plain capture:', err);
           systemLine('AI noise reduction unavailable — using browser filters only.', 'info');
         }
       }
       if (processorName === 'capture-worklet') {
-        await captureCtx.audioWorklet.addModule('worklets/capture-worklet.js');
+        if ((config.noiseReduction ?? DEFAULTS.noiseReduction) === 'ai' && context.sampleRate !== 48000) {
+          systemLine('Using browser noise reduction for this audio device.', 'info');
+        }
+        await context.audioWorklet.addModule('worklets/capture-worklet.js');
+        audio.assertActive();
       }
 
       const source = captureCtx.createMediaStreamSource(captureStream);
-      // Classical gain staging BEFORE any AI: an 80 Hz highpass kills rumble /
-      // handling noise, and a compressor catches spikes so nothing clips —
-      // RNNoise (and the VADs) want a stable, unclipped signal. Native nodes,
-      // zero CPU cost worth mentioning.
+      // Classical gain staging BEFORE any AI: a 100 Hz highpass kills rumble /
+      // handling noise / wind body (speech intelligibility lives above it),
+      // and a compressor catches spikes so nothing clips — RNNoise (and the
+      // VADs) want a stable, unclipped signal. Native nodes, zero CPU cost
+      // worth mentioning. The denoise worklet adds a second, ADAPTIVE highpass
+      // that slides up to 300 Hz when it detects wind buffeting.
       const highpass = captureCtx.createBiquadFilter();
       highpass.type = 'highpass';
-      highpass.frequency.value = 80;
+      highpass.frequency.value = 100;
       const compressor = captureCtx.createDynamicsCompressor();
       compressor.threshold.value = -24;
       compressor.knee.value = 30;
@@ -795,9 +1214,17 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       compressor.release.value = 0.25;
 
       const node = new AudioWorkletNode(captureCtx, processorName);
+      let firstFrame;
+      const captureStarted = new Promise((resolve) => { firstFrame = resolve; });
+      node.addEventListener('processorerror', () => console.error('[callgemini] capture processor failed:', processorName));
       node.port.onmessage = (e) => {
         const d = e.data;
-        if (d && d.buf) { onMicFrame(d.buf, d.np); return; }
+        if (d && d.buf) {
+          if (callAudio !== audio) return;
+          firstFrame();
+          onMicFrame(d.buf, d.np);
+          return;
+        }
         if (d && d.denoiseError) {
           console.error('[callgemini] RNNoise init failed:', d.denoiseError);
           systemLine(`AI noise reduction failed (${d.denoiseError}) — continuing without it.`, 'info');
@@ -808,6 +1235,14 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       const sink = captureCtx.createGain();
       sink.gain.value = 0;
       source.connect(highpass).connect(compressor).connect(node).connect(sink).connect(captureCtx.destination);
+      // Permission and state='running' are not proof of working capture on
+      // iOS. Require an actual PCM frame before announcing/dialing the call.
+      let frameTimer;
+      try {
+        await audio.waitFor(Promise.race([captureStarted, new Promise((_, reject) => {
+          frameTimer = setTimeout(() => reject(new Error('Microphone access was granted, but the browser produced no audio. Close other calls or recording apps, then tap Call again.')), 5000);
+        })]));
+      } finally { clearTimeout(frameTimer); }
     }
 
     /** Android WebView (Capacitor et al.): UA carries "; wv)" on modern builds
@@ -817,9 +1252,86 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       return ua.includes('; wv)') || (/Android/.test(ua) && /Version\/[\d.]+/.test(ua));
     }
 
-    async function startPlayback() {
-      playbackCtx = new AudioContext({ sampleRate: 24000 });
-      await playbackCtx.audioWorklet.addModule('worklets/playback-worklet.js');
+    function isAppleMobile() {
+      return /iPad|iPhone|iPod/.test(navigator.userAgent)
+        || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    }
+
+    /** Route playback to the configured output device. `target` is the
+     * playback <audio> element or the AudioContext (Chrome 110+ supports
+     * setSinkId on both). Unavailable device / unsupported browser → stay on
+     * the default sink, never break the call. */
+    async function applyOutputSink(target) {
+      const id = config.outputDeviceId ?? DEFAULTS.outputDeviceId;
+      if (!id || typeof target?.setSinkId !== 'function') return;
+      try {
+        await target.setSinkId(id);
+      } catch (err) {
+        console.error('[callgemini] setSinkId failed:', err);
+        systemLine('Selected audio output unavailable — using default.', 'info');
+      }
+    }
+
+    /** Config volume, clamped to the slider's 0–300% range. */
+    function volumePct() {
+      const pct = Number(config.volume ?? DEFAULTS.volume);
+      return Math.max(0, Math.min(300, Number.isFinite(pct) ? pct : 100));
+    }
+
+    /** Slider % → linear gain. 0–200% is what it says; 200–300% secretly
+     * ramps to DOUBLE the nominal boost (300% → ×6) for extra overdrive
+     * headroom — continuous at 200% so there's no jump mid-drag. The
+     * limiter behind the gain soaks the peaks. */
+    function volumeLevel() {
+      if (speakerMuted) return 0;
+      const pct = volumePct();
+      return pct <= 200 ? pct / 100 : 2 + ((pct - 200) / 100) * 4;
+    }
+
+    /** Reflect config.volume in the slider UI (label + overdrive tint). */
+    function renderVolume() {
+      const pct = Math.round(volumePct());
+      if (els.volSlider) els.volSlider.value = String(pct);
+      if (els.volVal) els.volVal.textContent = speakerMuted ? 'Muted' : `${pct}%`;
+      if (els.speakerBtn) {
+        const label = speakerMuted ? 'Unsilence speaker' : 'Silence speaker';
+        els.speakerBtn.title = label;
+        els.speakerBtn.setAttribute('aria-label', label);
+        els.speakerBtn.setAttribute('aria-pressed', String(speakerMuted));
+      }
+      if (els.volIconSlot) { els.volIconSlot.textContent = ''; els.volIconSlot.appendChild(icon(speakerMuted ? VolumeX : Volume2, 18)); }
+      if (els.volCtl) {
+        els.volCtl.dataset.muted = String(speakerMuted);
+        els.volCtl.dataset.overdrive = String(pct > 100);
+        els.volCtl.title = speakerMuted ? 'Speaker silenced — click the speaker to restore'
+          : pct > 200
+          ? `Playback volume — deep overdrive (×${volumeLevel().toFixed(1)} actual gain)`
+          : 'Playback volume — past 100% is overdrive';
+      }
+    }
+
+    /** Apply the configured volume to a live call (no-op between calls —
+     * startPlayback seeds the node from config). Short ramp, no zipper. */
+    function applyVolume() {
+      if (volumeGain && playbackCtx) {
+        volumeGain.gain.setTargetAtTime(volumeLevel(), playbackCtx.currentTime, 0.03);
+      }
+    }
+
+    /** Silence / unsilence Gemini's voice (output only — mic and call go on).
+     * Always reports the resulting state to the server, which is also the
+     * confirmation a remote set_speaker_muted waits for. */
+    function setSpeakerMuted(next) {
+      speakerMuted = !!next;
+      renderVolume();
+      applyVolume();
+      try { ws?.readyState === WebSocket.OPEN && ws.send(JSON.stringify({ type: 'speaker', muted: speakerMuted })); } catch { /* noop */ }
+    }
+    function toggleSpeaker() { setSpeakerMuted(!speakerMuted); }
+
+    async function startPlayback(audio) {
+      await audio.context.audioWorklet.addModule('worklets/playback-worklet.js?v=shared-native-v1');
+      audio.assertActive();
       playbackNode = new AudioWorkletNode(playbackCtx, 'playback-worklet');
       // The worklet reports exactly when model audio is audible — this drives
       // the software echo guard (stricter barge-in / server-mode mic gating)
@@ -833,17 +1345,41 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
           if (!vadSpeaking) preRoll.length = 0;
           return;
         }
-        if (e.data && e.data.t === 'level') modelLevel = e.data.v;
+        if (e.data && e.data.t === 'level') { modelLevel = e.data.v; return; }
+        if (e.data && e.data.t === 'underrun') {
+          // The jitter cushion just grew after a mid-sentence dry-out. Log
+          // each; tell the user once per call so field reports are possible
+          // without devtools.
+          console.log(`[callgemini] playback underrun — jitter cushion now ${e.data.cushionMs} ms`);
+          if (!underrunNoted) {
+            underrunNoted = true;
+            systemLine(`Network jitter detected — audio buffering increased to ${e.data.cushionMs} ms for this call.`, 'info');
+          }
+        }
       };
       // Fade stage so interruptions can ramp down instead of clicking off.
       playbackGain = playbackCtx.createGain();
       playbackNode.connect(playbackGain);
+      // User volume — SEPARATE node from the fade stage so softInterrupt's
+      // 0→1 restore never stomps the user's setting. Above 100% (overdrive)
+      // the limiter behind it catches the peaks so boosted audio saturates
+      // softly instead of hard-clipping at the DAC.
+      volumeGain = playbackCtx.createGain();
+      volumeGain.gain.value = volumeLevel();
+      const limiter = playbackCtx.createDynamicsCompressor();
+      limiter.threshold.value = -6;
+      limiter.knee.value = 6;
+      limiter.ratio.value = 20;
+      limiter.attack.value = 0.002;
+      limiter.release.value = 0.15;
+      playbackGain.connect(volumeGain).connect(limiter);
       if (isAndroidWebView()) {
         // WebView: the echoCancellation constraint usually isn't backed by a
         // real canceller, and media-element output plays on the (louder) media
         // audio path — the element route is pure downside there. Use the
         // direct route; the software echo guard handles the bleed.
-        playbackGain.connect(playbackCtx.destination);
+        limiter.connect(playbackCtx.destination);
+        await applyOutputSink(playbackCtx);
         return;
       }
       // Desktop: route through a MediaStream → hidden <audio> element instead
@@ -853,9 +1389,11 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       // Gemini's voice back into the mic and the VAD triggers on it. Costs a
       // few ms of element buffering — worth it.
       const dest = playbackCtx.createMediaStreamDestination();
-      playbackGain.connect(dest);
+      limiter.connect(dest);
       playbackEl = new Audio();
+      playbackEl.setAttribute('playsinline', '');
       playbackEl.srcObject = dest.stream;
+      await applyOutputSink(playbackEl);
       try {
         await playbackEl.play();
       } catch (err) {
@@ -864,8 +1402,9 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
         console.error('[callgemini] media-element playback blocked, falling back:', err);
         playbackEl.srcObject = null;
         playbackEl = null;
-        playbackGain.disconnect(dest);
-        playbackGain.connect(playbackCtx.destination);
+        limiter.disconnect(dest);
+        limiter.connect(playbackCtx.destination);
+        await applyOutputSink(playbackCtx);
       }
     }
 
@@ -923,51 +1462,103 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     }
 
     function stopAudio() {
-      try { captureStream?.getTracks().forEach((t) => t.stop()); } catch { /* noop */ }
-      try { captureCtx?.close(); } catch { /* noop */ }
-      try { playbackCtx?.close(); } catch { /* noop */ }
+      callAudio?.close();
+      callAudio = null;
       try { playbackEl?.pause(); if (playbackEl) playbackEl.srcObject = null; } catch { /* noop */ }
-      captureStream = null; captureCtx = null; playbackCtx = null; playbackNode = null; playbackGain = null; playbackEl = null;
+      captureStream = null; captureCtx = null; playbackCtx = null; playbackNode = null; playbackGain = null; volumeGain = null; playbackEl = null;
       fading = false;
     }
 
     async function startCall() {
       if (inCall) return;
+      // Plain-HTTP LAN origins (http://<ip>:3000) are insecure contexts: the
+      // browser removes audioWorklet, getUserMedia and CacheStorage there, so
+      // a call CANNOT work. Fail with the reason, not a cryptic TypeError.
+      if (!window.isSecureContext) {
+        systemLine(`Calls need a secure origin — this page is ${location.origin}, where the browser blocks microphone capture and audio processing. Open AuraOS via localhost, HTTPS, or the app wrapper (or allowlist this origin under chrome://flags/#unsafely-treat-insecure-origin-as-secure).`, 'error');
+        setStatus('error');
+        return;
+      }
       inCall = true;
       muted = false;
+      underrunNoted = false;
       updateControls();
       setStatus('connecting');
+      let audio;
       try {
-        // VAD mode is fixed at connect time, so resolve it BEFORE the start
-        // frame. initBrowserVad never throws — it degrades Silero → energy
-        // internally (and reports the exact failing stage). Server VAD only if
-        // even that dies, which would be a bug worth seeing loudly.
+        // Must run in the original tap, before the first await. Both graphs
+        // share one context; playback resamples Gemini's 24 kHz when needed.
+        // This iPad reports a running 48 kHz context whose clock never moves;
+        // its 24 kHz playback context does run. Use that rate for BOTH graphs
+        // on iOS, and native hardware rate elsewhere. Capture still emits 16 kHz.
+        audio = createCallAudio({ micDeviceId: config.micDeviceId ?? '',
+          ...(isAppleMobile() ? { sampleRate: 24000 } : {}) });
+        callAudio = audio;
+        captureCtx = playbackCtx = audio.context;
+        // VAD *mode* is fixed at connect time, but silero-vs-energy is purely
+        // client-side — the server only ever sees "browser VAD". So never
+        // block the dial on the ~16 MB Silero download: start with whichever
+        // tier is ready NOW and hot-swap to Silero the moment its warm-up
+        // (kicked off at page load) resolves. No re-dial needed.
         vadEngineKind = null;
         if ((config.vadMode ?? DEFAULTS.vadMode) === 'browser') {
-          try {
-            const engine = await initBrowserVad();
-            vadEngineKind = engine.kind;
-            systemLine(engine.kind === 'silero' ? 'Browser VAD: Silero' : 'Browser VAD: energy fallback', 'info');
-          } catch (err) {
-            console.error('[callgemini] browser VAD init failed:', err);
-            systemLine(`Browser VAD unavailable (${err?.message ?? err}) — using server voice detection.`, 'error');
+          const warm = warmSilero();
+          if (sileroReady) {
+            vadEngine = sileroReady;
+            vadEngineKind = 'silero';
+            systemLine('Browser VAD: Silero', 'info');
+          } else {
+            vadEngine = (energyEngine ??= createEnergyVad());
+            vadEngineKind = 'energy';
+            systemLine('Browser VAD: energy (Silero still warming up)', 'info');
+            warm.then((engine) => {
+              // Swap only if this call is still live and still on the fallback.
+              if (!engine || !inCall || vadEngineKind !== 'energy') return;
+              engine.resetState();
+              vadEngine = engine;
+              vadEngineKind = 'silero';
+              setVadBadge('silero');
+              systemLine('Silero VAD ready — switched over.', 'info');
+            });
           }
         }
         resetVadCallState();
         setVadBadge(vadEngineKind ?? 'server');   // what's REALLY driving this call
-        ws = await openWs();
+        await audio.microphone();
+        await audio.resume();
+        await startPlayback(audio);
+        audio.assertActive();
+        await startCapture(audio);
+        audio.assertActive();
+        const socket = await openWs();
+        if (callAudio !== audio) { socket.close(); return; }
+        ws = socket;
         // conversationId set → resume that conversation with its history as context.
         ws.send(buildStartFrame());
-        await startPlayback();
-        await startCapture();
         startLevelLoop();
-        systemLine('Call started', 'info');
+        systemLine(`Call started · ${describeSetup()}`, 'info');
       } catch (err) {
+        if (audio && callAudio !== audio) return; // call was cancelled/replaced
         console.error('[callgemini] startCall failed:', err);
         systemLine(`Could not start call: ${err?.message ?? err}`, 'error');
         endCall('start-failed');
+        setStatus('error');
       }
     }
+
+    // Foregrounding and a fresh tap are opportunities to resume audio after
+    // an iOS interruption. These handlers never request a new microphone.
+    function resumeCallAudio() {
+      const audio = callAudio;
+      if (!inCall || !audio || audio.context.state === 'running') return;
+      void audio.resume().catch((err) => {
+        if (callAudio === audio) console.warn('[callgemini] audio resume failed:', err.message);
+      });
+    }
+    document.addEventListener('pointerdown', resumeCallAudio, { passive: true });
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') resumeCallAudio();
+    });
 
     function endCall(_reason) {
       if (!inCall) return;
@@ -1015,12 +1606,12 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       }
     }
 
-    function renderMcpRows() {
+    /** Rows are a draft: only Save copies them into `config`. */
+    function renderMcpRows(list = config.mcpServers ?? []) {
       els.mcpList.textContent = '';
-      config.mcpServers.forEach((srv, idx) => {
+      list.forEach((srv) => {
         const row = document.createElement('div');
         row.className = 'mcp-row';
-        row.dataset.idx = String(idx);
 
         const url = document.createElement('input');
         url.className = 'field-input mcp-url';
@@ -1039,13 +1630,27 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
           transport.appendChild(opt);
         }
 
+        // Per-server tool-call behavior: async (default) answers slow calls
+        // with "working on it" and announces the result later; blocking makes
+        // Gemini wait for the full result (see src/server/mcp.mjs).
+        const behavior = document.createElement('select');
+        behavior.className = 'field-input mcp-behavior';
+        behavior.dataset.k = 'behavior';
+        behavior.title = 'Async: slow tools answer "working on it", the result is announced later. Blocking: Gemini waits for the full result.';
+        for (const [v, label] of [['non-blocking', 'Async'], ['blocking', 'Blocking']]) {
+          const opt = document.createElement('option');
+          opt.value = v; opt.textContent = label;
+          if ((srv.behavior === 'blocking' ? 'blocking' : 'non-blocking') === v) opt.selected = true;
+          behavior.appendChild(opt);
+        }
+
         const del = document.createElement('button');
         del.type = 'button';
         del.className = 'btn-del';
         del.dataset.action = 'mcp-del';
         del.textContent = 'Remove';
 
-        row.append(url, transport, del);
+        row.append(url, transport, behavior, del);
         els.mcpList.appendChild(row);
       });
     }
@@ -1055,6 +1660,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       return rows.map((row) => ({
         url: row.querySelector('.mcp-url').value.trim(),
         transport: row.querySelector('.mcp-transport').value,
+        behavior: row.querySelector('.mcp-behavior')?.value === 'blocking' ? 'blocking' : 'non-blocking',
       })).filter((s) => s.url);
     }
 
@@ -1065,6 +1671,53 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
         opt.value = o.value; opt.textContent = o.label;
         if (selected === o.value) opt.selected = true;
         sel.appendChild(opt);
+      }
+    }
+
+    /**
+     * Fill the mic / output selects from enumerateDevices. Labels are blank
+     * until mic permission is granted, so on a label-less list we try a
+     * one-shot getUserMedia (stopped immediately) to unlock them; if the user
+     * declines we still list the devices with generic names. Never throws —
+     * a failure just leaves "System default" as the only choice.
+     */
+    async function populateDeviceSelects() {
+      try {
+        if (!navigator.mediaDevices?.enumerateDevices) return;
+        let devices = await navigator.mediaDevices.enumerateDevices();
+        const unlabeled = devices.some((d) => (d.kind === 'audioinput' || d.kind === 'audiooutput') && d.deviceId && !d.label);
+        if (unlabeled) {
+          try {
+            const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+            s.getTracks().forEach((t) => t.stop());
+            devices = await navigator.mediaDevices.enumerateDevices();
+          } catch { /* permission declined — keep generic labels */ }
+        }
+        const toOpts = (kind, generic) => {
+          const opts = [{ value: '', label: 'System default' }];
+          let n = 0;
+          for (const d of devices) {
+            if (d.kind !== kind || !d.deviceId || d.deviceId === 'default') continue;
+            n += 1;
+            opts.push({ value: d.deviceId, label: d.label || `${generic} ${n}` });
+          }
+          return opts;
+        };
+        const fill = (sel, kind, generic, saved) => {
+          const opts = toOpts(kind, generic);
+          if (saved && !opts.some((o) => o.value === saved)) {
+            opts.push({ value: saved, label: `Saved device (unavailable)` });
+          }
+          fillSelect(sel, opts, saved ?? '');
+        };
+        // On a devicechange refresh the select already holds the user's (maybe
+        // unsaved) choice — keep that; on first fill fall back to the config.
+        const current = (sel, cfg) => (sel.options.length > 1 ? sel.value : (cfg ?? ''));
+        const saved = draft?.global ?? config;
+        fill(els.fMicDevice, 'audioinput', 'Microphone', current(els.fMicDevice, saved.micDeviceId));
+        fill(els.fOutputDevice, 'audiooutput', 'Speaker', current(els.fOutputDevice, saved.outputDeviceId));
+      } catch (err) {
+        console.error('[callgemini] device enumeration failed:', err);
       }
     }
 
@@ -1101,52 +1754,401 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
         .map((c) => c.dataset.lang);
     }
 
-    function openSettings() {
-      els.fApiKey.value = config.apiKey ?? '';
-      els.fSystem.value = config.systemInstruction ?? '';
+    // ── Settings view: a draft of `store`, committed on Save ────────────────
+    // Form fields are the view of the draft's current profile / role /
+    // version; pullForm() copies them back before anything re-renders (a
+    // profile, role, version or tab switch) and before dirty-check / Save.
+    let draft = null;
+    const settingsUi = { roleId: null, versionN: null };
+    const TAB_KEY = 'cg.settingsTab';
+    const TABS = ['roles', 'model', 'integrations', 'global'];
+
+    const draftProfile = () => activeProfile(draft);
+    const viewedRole = () => draftProfile().roles.find((r) => r.id === settingsUi.roleId) ?? null;
+
+    /** "Work · Developer v3" — what the next call will use. */
+    function describeSetup(s = store) {
+      const p = activeProfile(s);
+      const r = activeRole(p);
+      return r ? `${p.name} · ${r.name} v${r.activeVersion}` : `${p.name} · default prompt`;
+    }
+
+    function pullForm() {
+      if (!draft) return;
+      const g = draft.global;
+      g.apiKey = els.fApiKey.value.trim();
+      g.languages = readLangChips();
+      g.micDeviceId = deviceValue(els.fMicDevice, g.micDeviceId);
+      g.outputDeviceId = deviceValue(els.fOutputDevice, g.outputDeviceId);
+      g.noiseReduction = els.fNoise.value || DEFAULTS.noiseReduction;
+      g.vadMode = els.fVadMode.value || DEFAULTS.vadMode;
+      g.responsiveness = els.fResponsiveness.value || DEFAULTS.responsiveness;
+
+      const p = draftProfile();
+      const preset = els.fModelPreset.value;
+      p.model = (preset === 'custom' ? els.fModel.value.trim() : preset) || DEFAULTS.model;
+      p.voiceName = els.fVoice.value || DEFAULTS.voiceName;
+      p.acpAddress = els.fAcpAddress.value.trim();
+      p.mcpServers = readMcpRows();
+
+      const r = viewedRole();
+      if (r && !isFrozen(r, settingsUi.versionN)) versionOf(r, settingsUi.versionN).text = els.fRoleText.value;
+    }
+
+    function renderGlobalFields() {
+      const g = draft.global;
+      els.fApiKey.value = g.apiKey ?? '';
+      fillSelect(els.fVadMode, VAD_MODE_OPTS, g.vadMode ?? DEFAULTS.vadMode);
+      fillSelect(els.fNoise, NOISE_OPTS, g.noiseReduction ?? DEFAULTS.noiseReduction);
+      fillSelect(els.fResponsiveness, RESPONSIVENESS_OPTS, g.responsiveness ?? DEFAULTS.responsiveness);
+      renderLangChips(g.languages ?? DEFAULTS.languages);
+      // Device lists load async (enumeration + possible permission prompt);
+      // until then the selects just show "System default".
+      fillSelect(els.fMicDevice, [{ value: '', label: 'System default' }], '');
+      fillSelect(els.fOutputDevice, [{ value: '', label: 'System default' }], '');
+      void populateDeviceSelects();
+    }
+
+    function renderProfileBar() {
+      fillSelect(els.profileSelect, draft.profiles.map((p) => ({ value: p.id, label: p.name })), draft.activeProfileId);
+      const del = els.settingsView.querySelector('[data-action="profile-delete"]');
+      if (del) del.disabled = draft.profiles.length < 2;
+    }
+
+    function renderProfileFields() {
+      const p = draftProfile();
       // Model: select the matching preset, else Custom… with the raw id shown.
-      const modelId = config.model ?? DEFAULTS.model;
-      const preset = MODEL_PRESETS.find((p) => p.value === modelId) ? modelId : 'custom';
+      const modelId = p.model || DEFAULTS.model;
+      const preset = MODEL_PRESETS.find((m) => m.value === modelId) ? modelId : 'custom';
       fillSelect(els.fModelPreset, MODEL_PRESETS, preset);
       els.fModel.value = preset === 'custom' ? modelId : '';
       syncModelCustomVisibility();
-      fillSelect(els.fVoice, VOICES.map((v) => ({ value: v, label: v })), config.voiceName ?? DEFAULTS.voiceName);
-      fillSelect(els.fVadMode, VAD_MODE_OPTS, config.vadMode ?? DEFAULTS.vadMode);
-      fillSelect(els.fNoise, NOISE_OPTS, config.noiseReduction ?? DEFAULTS.noiseReduction);
-      fillSelect(els.fResponsiveness, RESPONSIVENESS_OPTS, config.responsiveness ?? DEFAULTS.responsiveness);
-      renderLangChips(config.languages ?? DEFAULTS.languages);
-      renderMcpRows();
-      els.modal.dataset.open = 'true';
+      fillSelect(els.fVoice, VOICES.map((v) => ({ value: v, label: v })), p.voiceName || DEFAULTS.voiceName);
+      els.fAcpAddress.value = p.acpAddress ?? '';
+      renderMcpRows(p.mcpServers ?? []);
     }
 
+    function renderRoles() {
+      const p = draftProfile();
+      if (!viewedRole()) settingsUi.roleId = p.activeRoleId ?? p.roles[0]?.id ?? null;
+      const r = viewedRole();
+      if (r && !versionOf(r, settingsUi.versionN)) settingsUi.versionN = r.activeVersion;
+
+      const label = (x) => (x.id === p.activeRoleId ? `${x.name} · active` : x.name);
+      fillSelect(els.roleSelect, p.roles.map((x) => ({ value: x.id, label: label(x) })), settingsUi.roleId);
+      els.roleSelect.disabled = p.roles.length === 0;
+
+      // Wide layout: the same roles as a clickable list (createElement — see the
+      // is:global note on the style block).
+      els.rolesList.textContent = '';
+      for (const x of p.roles) {
+        const item = document.createElement('button');
+        item.type = 'button';
+        item.className = 'roles-list-item';
+        item.dataset.roleId = x.id;
+        item.dataset.selected = String(x.id === settingsUi.roleId);
+        item.dataset.active = String(x.id === p.activeRoleId);
+        const name = document.createElement('span');
+        name.className = 'roles-list-name';
+        name.textContent = x.name;
+        const meta = document.createElement('span');
+        meta.className = 'roles-list-meta';
+        meta.textContent = x.id === p.activeRoleId ? `active · v${x.activeVersion}` : `v${x.activeVersion}`;
+        item.append(name, meta);
+        els.rolesList.appendChild(item);
+      }
+
+      els.roleEmpty.dataset.show = String(!r);
+      els.roleCard.dataset.show = String(!!r);
+      if (!r) return;
+      els.roleName.textContent = r.name;
+      const isActive = r.id === p.activeRoleId;
+      els.roleActiveBadge.dataset.show = String(isActive);
+      els.roleActivate.dataset.show = String(!isActive);
+      renderVersion();
+    }
+
+    function renderVersion() {
+      const r = viewedRole();
+      if (!r) return;
+      const latest = latestN(r);
+      const n = settingsUi.versionN;
+      fillSelect(els.versionSelect, [...r.versions].sort((a, b) => b.n - a.n).map((v) => ({
+        value: String(v.n),
+        label: `v${v.n}${v.n === r.activeVersion ? ' · in use' : ''}`,
+      })), String(n));
+      const frozen = isFrozen(r, n);
+      const inUse = n === r.activeVersion;
+      els.versionState.dataset.state = frozen ? 'frozen' : 'editable';
+      els.versionState.textContent = frozen ? 'Frozen' : 'Editable';
+      els.fRoleText.value = versionOf(r, n)?.text ?? '';
+      els.fRoleText.readOnly = frozen;
+      els.versionUse.disabled = inUse;
+      els.versionHint.textContent = frozen
+        ? `v${n} is frozen. “New version” copies it into v${latest + 1} to edit.`
+        : inUse
+          ? 'Calls use this version. Applies to your next call.'
+          : `Calls still use v${r.activeVersion} — press “Use this version” to switch.`;
+    }
+
+    function selectSettingsTab(tab, focus = false) {
+      if (!TABS.includes(tab)) tab = 'roles';
+      els.settingsView.dataset.tab = tab;
+      els.settingsView.querySelectorAll('.settings-tab').forEach((b) => {
+        const on = b.dataset.tab === tab;
+        b.setAttribute('aria-selected', String(on));
+        b.tabIndex = on ? 0 : -1;
+        if (on && focus) b.focus();
+      });
+      els.settingsView.querySelectorAll('.settings-panel').forEach((panel) => {
+        panel.dataset.active = String(panel.dataset.panel === tab);
+      });
+      try { localStorage.setItem(TAB_KEY, tab); } catch { /* storage blocked — not needed */ }
+    }
+
+    function openSettings(tab) {
+      draft = JSON.parse(JSON.stringify(store));
+      settingsUi.roleId = null;
+      settingsUi.versionN = null;
+      renderGlobalFields();
+      renderProfileBar();
+      renderProfileFields();
+      renderRoles();
+      closeMenus();
+      hideInline();
+      setSettingsConfirm(false);
+      closeSidebar();
+      closeMcpBar();
+      let remembered = null;
+      try { remembered = localStorage.getItem(TAB_KEY); } catch { /* storage blocked */ }
+      selectSettingsTab(tab ?? remembered ?? 'roles');
+      els.appEl.dataset.view = 'settings';
+      const body = els.settingsView.querySelector('.settings-body');
+      if (body) body.scrollTop = 0;
+      els.settingsView.querySelector('[data-action="settings-close"]')?.focus();
+    }
+
+    function isSettingsOpen() { return els.appEl?.dataset.view === 'settings'; }
+
     function closeSettings() {
-      els.modal.dataset.open = 'false';
+      if (!isSettingsOpen()) return;
+      els.appEl.dataset.view = 'chat';
+      setSettingsConfirm(false);
+      closeMenus();
+      hideInline();
+      draft = null;
+      els.settingsBtn?.focus();
+    }
+
+    /** Footer mode: normal (Cancel/Save) or the discard prompt. */
+    function setSettingsConfirm(on) {
+      if (!els.settingsFoot) return;
+      els.settingsFoot.dataset.confirm = String(on);
+      if (on) els.settingsFoot.querySelector('[data-action="settings-keep"]')?.focus();
+    }
+
+    /** Before enumeration finishes a device select holds only "System
+     * default" — read the saved id then, or a quick Save would reset it. */
+    function deviceValue(sel, saved) {
+      return sel.options.length > 1 ? sel.value : (saved ?? '');
+    }
+
+    function isSettingsDirty() {
+      pullForm();
+      return canonicalStore(draft) !== canonicalStore(store);
+    }
+
+    /** Back / Cancel / Escape: leave directly, or ask first if edits would be lost. */
+    function requestCloseSettings() {
+      if (els.settingsFoot?.dataset.confirm === 'true' || !isSettingsDirty()) closeSettings();
+      else setSettingsConfirm(true);
     }
 
     function saveSettings() {
-      const preset = els.fModelPreset.value;
-      config = {
-        ...config,
-        apiKey: els.fApiKey.value.trim(),
-        model: (preset === 'custom' ? els.fModel.value.trim() : preset) || DEFAULTS.model,
-        voiceName: els.fVoice.value || DEFAULTS.voiceName,
-        vadMode: els.fVadMode.value || DEFAULTS.vadMode,
-        noiseReduction: els.fNoise.value || DEFAULTS.noiseReduction,
-        responsiveness: els.fResponsiveness.value || DEFAULTS.responsiveness,
-        languages: readLangChips(),
-        systemInstruction: els.fSystem.value.trim(),
-        mcpServers: readMcpRows(),
-      };
-      // Close immediately — never block the dialog on the network round-trip.
+      pullForm();
+      for (const p of draft.profiles) {
+        for (const r of p.roles) for (const v of r.versions) v.text = (v.text ?? '').trim();
+      }
+      store = draft;
+      config = resolveConfig(store, DEFAULTS);
+      // Close immediately — never block the view on the network round-trip.
       // The in-memory config is already updated and is what a call uses; the
       // KV write only matters for persistence across reloads.
       closeSettings();
-      systemLine('Settings saved', 'info');
+      systemLine(`Settings saved — next call: ${describeSetup()}`, 'info');
       renderMcpBadge();
       renderMcpBar();
+      if (config.vadMode === 'browser') warmSilero();
       saveConfig().then((ok) => {
         if (ok === false) systemLine('Kept for this session, but could not persist settings.', 'error');
       });
+    }
+
+    // ── Settings: ⋯ menus and the inline rename / delete bar ────────────────
+    function closeMenus() {
+      els.settingsView?.querySelectorAll('.settings-menu[data-open="true"]').forEach((m) => { m.dataset.open = 'false'; });
+      els.settingsView?.querySelectorAll('[data-action="menu-toggle"]').forEach((b) => b.setAttribute('aria-expanded', 'false'));
+    }
+
+    function toggleMenu(btn) {
+      const panel = els.settingsView.querySelector(`[data-menu-panel="${btn.dataset.menu}"]`);
+      const open = panel?.dataset.open !== 'true';
+      closeMenus();
+      if (!panel || !open) return;
+      panel.dataset.open = 'true';
+      btn.setAttribute('aria-expanded', 'true');
+      panel.querySelector('.menu-item:not(:disabled)')?.focus();
+    }
+
+    let inlineAction = null; // what the inline bar's OK does
+
+    /** mode 'rename' shows a name input; mode 'confirm' just a message. */
+    function showInline(which, { mode, message, value = '', okLabel, danger = false, onOk }) {
+      hideInline();
+      const bar = els.settingsView.querySelector(`[data-inline="${which}"]`);
+      if (!bar) return;
+      bar.dataset.mode = mode;
+      bar.querySelector('.inline-bar-msg').textContent = message;
+      const ok = bar.querySelector('.inline-bar-ok');
+      ok.textContent = okLabel;
+      ok.dataset.danger = String(danger);
+      inlineAction = onOk;
+      const input = bar.querySelector('.inline-bar-input');
+      if (mode === 'rename') { input.value = value; input.focus(); input.select(); } else ok.focus();
+    }
+
+    function hideInline() {
+      els.settingsView?.querySelectorAll('.inline-bar').forEach((b) => { b.dataset.mode = 'none'; });
+      inlineAction = null;
+    }
+
+    function runInline(bar) {
+      pullForm(); // the action re-renders the editor — keep unsaved text
+      const action = inlineAction;
+      const name = bar.querySelector('.inline-bar-input').value.trim();
+      if (bar.dataset.mode === 'rename' && !name) { bar.querySelector('.inline-bar-input').focus(); return; }
+      hideInline();
+      action?.(name);
+    }
+
+    function renameProfile() {
+      const p = draftProfile();
+      showInline('profile', {
+        mode: 'rename', message: 'Profile name', value: p.name, okLabel: 'Rename',
+        onOk: (name) => { p.name = name; renderProfileBar(); },
+      });
+    }
+
+    function renameRole() {
+      const r = viewedRole();
+      if (!r) return;
+      showInline('role', {
+        mode: 'rename', message: 'Role name', value: r.name, okLabel: 'Rename',
+        onOk: (name) => { r.name = name; renderRoles(); },
+      });
+    }
+
+    /** Switch profile/role in the draft: save the form into the old one first. */
+    function switchProfile(id) {
+      pullForm();
+      draft.activeProfileId = id;
+      settingsUi.roleId = null;
+      settingsUi.versionN = null;
+      hideInline();
+      renderProfileBar();
+      renderProfileFields();
+      renderRoles();
+    }
+
+    function viewRole(id) {
+      pullForm();
+      settingsUi.roleId = id;
+      settingsUi.versionN = null;
+      hideInline();
+      renderRoles();
+    }
+
+    function settingsAction(action) {
+      if (!draft) return false; // e.g. Save's own listener already closed the view
+      const p = draftProfile();
+      const r = viewedRole();
+      switch (action) {
+        case 'profile-new':
+        case 'profile-duplicate': {
+          pullForm();
+          const taken = draft.profiles.map((x) => x.name);
+          const fresh = action === 'profile-new'
+            ? blankProfile(uniqueName('New profile', taken), DEFAULTS)
+            : duplicateProfile(p, uniqueName(`${p.name} copy`, taken));
+          draft.profiles.push(fresh);
+          switchProfile(fresh.id);
+          renameProfile();
+          break;
+        }
+        case 'profile-rename': renameProfile(); break;
+        case 'profile-delete':
+          if (draft.profiles.length < 2) break;
+          showInline('profile', {
+            mode: 'confirm', message: `Delete profile “${p.name}” and its ${p.roles.length} role(s)?`, okLabel: 'Delete', danger: true,
+            onOk: () => {
+              draft.profiles = draft.profiles.filter((x) => x.id !== p.id);
+              draft.activeProfileId = draft.profiles[0].id;
+              settingsUi.roleId = null;
+              settingsUi.versionN = null;
+              renderProfileBar();
+              renderProfileFields();
+              renderRoles();
+            },
+          });
+          break;
+        case 'role-new':
+        case 'role-duplicate': {
+          pullForm();
+          const taken = p.roles.map((x) => x.name);
+          const fresh = action === 'role-new' || !r
+            ? newRole(uniqueName('New role', taken))
+            : newRole(uniqueName(`${r.name} copy`, taken), versionOf(r, settingsUi.versionN)?.text ?? '');
+          p.roles.push(fresh);
+          if (!p.activeRoleId) p.activeRoleId = fresh.id;
+          settingsUi.roleId = fresh.id;
+          settingsUi.versionN = null;
+          renderRoles();
+          renameRole();
+          break;
+        }
+        case 'role-rename': renameRole(); break;
+        case 'role-activate':
+          if (r) { pullForm(); p.activeRoleId = r.id; renderRoles(); }
+          break;
+        case 'role-delete':
+          if (!r) break;
+          showInline('role', {
+            mode: 'confirm', message: `Delete role “${r.name}” and its ${r.versions.length} version(s)?`, okLabel: 'Delete', danger: true,
+            onOk: () => {
+              p.roles = p.roles.filter((x) => x.id !== r.id);
+              if (p.activeRoleId === r.id) p.activeRoleId = p.roles[0]?.id ?? null;
+              settingsUi.roleId = null;
+              settingsUi.versionN = null;
+              renderRoles();
+            },
+          });
+          break;
+        case 'version-new':
+          if (!r) break;
+          pullForm();
+          settingsUi.versionN = addVersion(r, settingsUi.versionN);
+          renderVersion();
+          els.fRoleText.focus();
+          break;
+        case 'version-use':
+          if (!r) break;
+          pullForm();
+          r.activeVersion = settingsUi.versionN;
+          renderRoles();
+          break;
+        default: return false;
+      }
+      return true;
     }
 
     // ── Conversations sidebar (overlay drawer) ──────────────────────────────
@@ -1186,12 +2188,12 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       for (const s of config.mcpServers ?? []) {
         if (!s?.url || seen.has(s.url)) continue;
         seen.add(s.url);
-        out.push({ url: s.url, transport: s.transport ?? 'http', name: '', temporary: false });
+        out.push({ url: s.url, transport: s.transport ?? 'http', name: '', temporary: false, behavior: s.behavior === 'blocking' ? 'blocking' : 'non-blocking' });
       }
       for (const t of tempServers) {
         if (!t?.url || seen.has(t.url)) continue;
         seen.add(t.url);
-        out.push({ url: t.url, transport: t.transport ?? 'http', name: t.name ?? '', temporary: true });
+        out.push({ url: t.url, transport: t.transport ?? 'http', name: t.name ?? '', temporary: true, behavior: t.behavior === 'blocking' ? 'blocking' : 'non-blocking' });
       }
       return out;
     }
@@ -1506,6 +2508,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     function clearTranscript() {
       els.transcript.innerHTML = '';
       activeBubbles.user = null; activeBubbles.model = null;
+      pendingText.user = ''; pendingText.model = '';
       toolChips.clear();
     }
 
@@ -1537,6 +2540,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       resetMcpState(); // a fresh chat starts with every server ON
       showEmptyState();
       activeBubbles.user = null; activeBubbles.model = null; toolChips.clear();
+      pendingText.user = ''; pendingText.model = '';
       setStatus('idle');
       if (!keepSidebar) closeSidebar();
       updateActiveConvHighlight();
@@ -1549,6 +2553,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       resetMcpState();
       showEmptyState();
       activeBubbles.user = null; activeBubbles.model = null; toolChips.clear();
+      pendingText.user = ''; pendingText.model = '';
       setStatus('idle');
     }
 
@@ -1591,7 +2596,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       if (els.mcpbarInfo?.dataset.open === 'true' && !e.target.closest('[data-role="mcpbar-info"]')) setMcpInfo(false);
     });
     document.addEventListener('keydown', (e) => { if (e.key === 'Escape') setMcpInfo(false); });
-    els.mcpbarSettings?.addEventListener('click', () => { closeMcpBar(); openSettings(); });
+    els.mcpbarSettings?.addEventListener('click', () => { closeMcpBar(); openSettings('integrations'); });
     // Delegated toggles for the runtime-rendered MCP rows.
     els.mcpToggleList?.addEventListener('click', (e) => {
       const btn = e.target.closest('[data-action="mcp-onoff"], [data-action="mcp-skip"], [data-action="mcp-remove"]');
@@ -1625,21 +2630,95 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
 
     els.callBtn?.addEventListener('click', toggleCall);
     els.muteBtn?.addEventListener('click', toggleMute);
-    els.settingsBtn?.addEventListener('click', openSettings);
+    els.speakerBtn?.addEventListener('click', toggleSpeaker);
+    els.volSlider?.addEventListener('input', () => {
+      config.volume = Number(els.volSlider.value);
+      store.global.volume = config.volume;
+      // Dragging the slider means "I want to hear it": unsilence at the new level.
+      if (speakerMuted) setSpeakerMuted(false);
+      renderVolume();
+      applyVolume();
+      // Persist AFTER the drag settles — one KV write, not one per tick.
+      clearTimeout(volSaveTimer);
+      volSaveTimer = setTimeout(() => saveConfig(), 600);
+    });
+    els.settingsBtn?.addEventListener('click', () => openSettings());
+    // Plug/unplug while settings are open → refresh the device dropdowns.
+    navigator.mediaDevices?.addEventListener?.('devicechange', () => {
+      if (isSettingsOpen()) void populateDeviceSelects();
+    });
     els.settingsSave?.addEventListener('click', saveSettings);
     els.fModelPreset?.addEventListener('change', syncModelCustomVisibility);
-    // Two elements carry data-action="settings-close" (the ✕ and the Cancel
-    // button); querySelector would only bind the first. Delegate on the modal
-    // so BOTH close it — and a click on the backdrop (outside the panel) too.
-    els.modal?.addEventListener('click', (e) => {
-      if (e.target.closest('[data-action="settings-close"]') || e.target === els.modal) {
-        closeSettings();
+    // ACP "Discover": ask the OS registry for live ACP interfaces and take the
+    // first one's address (absolute → shell route, same origin as the app).
+    els.acpDiscover?.addEventListener('click', async () => {
+      try {
+        const res = await fetch('/api/interfaces?kind=acp&live=1');
+        const data = res.ok ? await res.json() : null;
+        const iface = (data?.interfaces ?? []).find((i) => i?.address);
+        if (iface) {
+          els.fAcpAddress.value = iface.address;
+        } else {
+          systemLine('No live ACP interface found.', 'info');
+        }
+      } catch (err) {
+        systemLine(`ACP discovery failed: ${err?.message ?? err}`, 'error');
       }
     });
+    // All settings buttons are delegated on the view (several share an action,
+    // e.g. the two "settings-close" and the two "role-new" buttons).
+    els.settingsView?.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-action]');
+      if (!e.target.closest('.menu-anchor')) closeMenus();
+      if (!btn || btn.disabled) return;
+      const action = btn.dataset.action;
+      if (action === 'settings-close') requestCloseSettings();
+      else if (action === 'settings-keep') setSettingsConfirm(false);
+      else if (action === 'settings-discard') closeSettings();
+      else if (action === 'menu-toggle') toggleMenu(btn);
+      else if (action === 'inline-ok') runInline(btn.closest('.inline-bar'));
+      else if (action === 'inline-cancel') hideInline();
+      else if (settingsAction(action)) closeMenus();
+    });
+    els.settingsView?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && e.target.closest('.inline-bar-input')) {
+        e.preventDefault();
+        runInline(e.target.closest('.inline-bar'));
+        return;
+      }
+      if (e.key !== 'Escape') return;
+      e.preventDefault();
+      // Innermost first: menu → inline bar → discard prompt → leave.
+      if (els.settingsView.querySelector('.settings-menu[data-open="true"]')) closeMenus();
+      else if (els.settingsView.querySelector('.inline-bar:not([data-mode="none"])')) hideInline();
+      else if (els.settingsFoot?.dataset.confirm === 'true') setSettingsConfirm(false);
+      else requestCloseSettings();
+    });
+    els.profileSelect?.addEventListener('change', () => switchProfile(els.profileSelect.value));
+    els.roleSelect?.addEventListener('change', () => viewRole(els.roleSelect.value));
+    els.rolesList?.addEventListener('click', (e) => {
+      const item = e.target.closest('.roles-list-item[data-role-id]');
+      if (item) viewRole(item.dataset.roleId);
+    });
+    els.versionSelect?.addEventListener('change', () => {
+      pullForm();
+      settingsUi.versionN = Number(els.versionSelect.value);
+      renderVersion();
+    });
+    // Tabs: click, plus ←/→/Home/End between them (roving tabindex).
+    els.settingsTabs?.addEventListener('click', (e) => {
+      const tab = e.target.closest('.settings-tab');
+      if (tab) selectSettingsTab(tab.dataset.tab);
+    });
+    els.settingsTabs?.addEventListener('keydown', (e) => {
+      const i = TABS.indexOf(els.settingsView.dataset.tab);
+      const next = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: TABS.length - 1 }[e.key];
+      if (next === undefined) return;
+      e.preventDefault();
+      selectSettingsTab(TABS[(next + TABS.length) % TABS.length], true);
+    });
     els.mcpAdd?.addEventListener('click', () => {
-      config.mcpServers = readMcpRows();
-      config.mcpServers.push({ url: '', transport: 'http' });
-      renderMcpRows();
+      renderMcpRows([...readMcpRows(), { url: '', transport: 'http' }]);
     });
     // Language chips: toggle a language, or "Any" to clear all → auto-detect.
     els.langChips?.addEventListener('click', (e) => {
@@ -1658,11 +2737,9 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     });
     // Delegated remove for dynamically-rendered MCP rows.
     els.mcpList?.addEventListener('click', (e) => {
-      const del = e.target.closest('[data-action="mcp-del"]');
-      if (!del) return;
-      const idx = Number(del.closest('.mcp-row')?.dataset.idx);
-      config.mcpServers = readMcpRows().filter((_, i) => i !== idx);
-      renderMcpRows();
+      // Drop the row itself: readMcpRows() skips blank rows, so an index
+      // into it would point at the wrong server.
+      e.target.closest('[data-action="mcp-del"]')?.closest('.mcp-row')?.remove();
     });
     els.textForm?.addEventListener('submit', (e) => {
       e.preventDefault();
@@ -1680,8 +2757,11 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       const osClient = new OsClient();
       osClient.keymap.on('toggle-call', toggleCall);
       osClient.keymap.on('mute', toggleMute);
+      osClient.keymap.on('mute-speaker', toggleSpeaker);
       osClient.keymap.on('toggle-conversations', toggleSidebar);
       osClient.nav.onBack((e) => {
+        // Back leaves settings first; only from the chat does it end a call.
+        if (isSettingsOpen()) { e.preventDefault(); requestCloseSettings(); return; }
         if (inCall) { e.preventDefault(); endCall('os-back'); }
       });
     }).catch(() => { /* running outside the OS shell */ });
@@ -1690,12 +2770,17 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     mountIcons();
     setStatus('idle');
     updateControls();
+    renderVolume();
     renderMcpBar();
     loadConfig().then(() => {
       renderMcpBar();
       if (!config.apiKey && !window.GEMINI_API_KEY_PRESENT) {
         systemLine('No Gemini API key set. Open Settings (⚙) to add one, or set GEMINI_API_KEY in AuraOS Context.', 'info');
       }
+      // Warm Silero in the background so the first call doesn't wait on the
+      // ~16 MB download + session build (startCall hot-swaps if it's not done).
+      if ((config.vadMode ?? DEFAULTS.vadMode) === 'browser') warmSilero();
+      renderVolume();
     });
   </script>
 
@@ -1973,6 +3058,40 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       border-color: var(--aura-color-danger); color: var(--aura-color-danger);
     }
 
+    /* Playback volume: icon + slider + live % next to Mute. Past 100% the
+       whole control tints toward warning — overdrive is a state you should
+       SEE, since it means the limiter is working the signal. */
+    .vol-ctl {
+      display: inline-flex; align-items: center; gap: 7px;
+      color: var(--aura-color-text-dim);
+    }
+    .vol-icon { display: inline-flex; }
+    /* Speaker icon = one-click silence toggle. */
+    .vol-mute-btn {
+      background: transparent; border: 0; padding: 2px; margin: 0;
+      color: inherit; cursor: pointer; border-radius: 6px;
+    }
+    .vol-mute-btn:hover { color: var(--aura-color-text); }
+    .vol-mute-btn:focus-visible { outline: 2px solid var(--aura-color-primary); outline-offset: 1px; }
+    .vol-slider {
+      width: 90px; margin: 0;
+      accent-color: var(--aura-color-primary);
+    }
+    .vol-val {
+      font-size: 12px; font-variant-numeric: tabular-nums;
+      min-width: 4ch; text-align: right;
+    }
+    .vol-ctl[data-overdrive="true"] {
+      color: var(--aura-color-warning);
+    }
+    .vol-ctl[data-overdrive="true"] .vol-slider {
+      accent-color: var(--aura-color-warning);
+    }
+    /* Silenced wins over overdrive: a mute you can't see is a bug report. */
+    .vol-ctl[data-muted="true"],
+    .vol-ctl[data-muted="true"] .vol-mute-btn { color: var(--aura-color-danger); }
+    .vol-ctl[data-muted="true"] .vol-slider { opacity: 0.5; accent-color: var(--aura-color-danger); }
+
     .call-btn {
       flex: 1; background: var(--aura-color-primary); color: var(--aura-color-bg);
       border-color: transparent; font-size: 15px; padding: 11px 16px;
@@ -1990,26 +3109,162 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
         color-mix(in srgb, var(--aura-color-info) 60%, transparent);
     }
 
-    /* Settings modal */
-    .modal-overlay {
-      position: fixed; inset: 0; display: none;
-      align-items: center; justify-content: center; padding: 20px;
-      background: color-mix(in srgb, var(--aura-color-bg) 70%, transparent);
+    /* ── Settings view (full-window page over the chat) ─────────────────
+       The chat stays mounted underneath (call audio + WS keep running);
+       `visibility` hides it and takes it out of the tab order. */
+    .cg-settings {
+      position: absolute; inset: 0; z-index: 40;
+      display: none; flex-direction: column;
+      background: var(--aura-color-bg); color: var(--aura-color-text);
     }
-    .modal-overlay[data-open="true"] { display: flex; }
-    .modal-panel {
-      width: 100%; max-width: 460px; max-height: 88vh; overflow: hidden;
-      display: flex; flex-direction: column;
-      background: var(--aura-color-surface); color: var(--aura-color-text);
-      border: 1px solid var(--aura-color-border); border-radius: 14px;
+    .cg-app[data-view="settings"] .cg-settings { display: flex; }
+    .cg-app[data-view="settings"] > :not(.cg-settings) { visibility: hidden; }
+    .settings-head {
+      display: flex; align-items: center; gap: 10px; flex: 0 0 auto;
+      padding: 10px 14px; border-bottom: 1px solid var(--aura-color-border);
     }
-    /* Fixed header + footer, scrollable middle. */
-    .modal-head, .modal-foot { display: flex; align-items: center; justify-content: space-between; flex: 0 0 auto; }
-    .modal-head { padding: 9px 14px; border-bottom: 1px solid var(--aura-color-border); }
-    .modal-body { flex: 1 1 auto; overflow-y: auto; padding: 16px 18px; display: flex; flex-direction: column; gap: 14px; }
-    .modal-foot { gap: 10px; padding: 9px 14px; border-top: 1px solid var(--aura-color-border); }
-    .modal-foot .call-btn { flex: 0 0 auto; }
-    .modal-title { margin: 0; font-size: 16px; }
+    .settings-title { margin: 0; font-size: 16px; flex: 1; }
+    /* Only worth showing while a call is up ("Idle" is noise here). */
+    .settings-head .status-pill[data-state="idle"] { display: none; }
+    .settings-body { flex: 1 1 auto; overflow-y: auto; padding: 16px 18px 20px; }
+
+    /* Profile bar: which AI setup the tabs below edit. */
+    .settings-profilebar {
+      display: flex; align-items: center; gap: 8px; flex: 0 0 auto;
+      padding: 10px 14px; background: var(--aura-color-surface);
+      border-bottom: 1px solid var(--aura-color-border);
+    }
+    .profilebar-label { font-size: 12px; font-weight: 700; color: var(--aura-color-text-dim); }
+    .profile-select { flex: 1; min-width: 0; font-weight: 600; }
+    /* Global settings are not per profile — dim the profile bar on that tab. */
+    .cg-settings[data-tab="global"] .settings-profilebar { opacity: 0.55; }
+
+    /* ⋯ menus */
+    .menu-anchor { position: relative; flex: 0 0 auto; }
+    .settings-menu {
+      display: none; position: absolute; top: calc(100% + 4px); right: 0; z-index: 10;
+      min-width: 160px; padding: 4px; flex-direction: column;
+      background: var(--aura-color-surface-2); border: 1px solid var(--aura-color-border);
+      border-radius: 10px; box-shadow: var(--aura-glow-subtle);
+    }
+    .settings-menu[data-open="true"] { display: flex; }
+    .menu-item {
+      font: inherit; font-size: 13px; text-align: left; cursor: pointer;
+      padding: 7px 10px; border: none; border-radius: 6px;
+      background: transparent; color: var(--aura-color-text);
+    }
+    .menu-item:hover:not(:disabled), .menu-item:focus-visible { background: var(--aura-color-surface); }
+    .menu-item:disabled { opacity: 0.45; cursor: default; }
+    .menu-item-danger { color: var(--aura-color-danger); }
+
+    /* Inline rename / delete-confirm bar (iframes may block prompt()/confirm()). */
+    .inline-bar {
+      display: none; align-items: center; gap: 8px; flex-wrap: wrap;
+      padding: 8px 14px; background: var(--aura-color-surface-2);
+      border-bottom: 1px solid var(--aura-color-border);
+    }
+    .inline-bar:not([data-mode="none"]) { display: flex; }
+    .inline-bar-msg { font-size: 13px; font-weight: 600; }
+    .inline-bar-input { flex: 1; min-width: 120px; display: none; }
+    .inline-bar[data-mode="rename"] .inline-bar-input { display: block; }
+    .inline-bar[data-mode="confirm"] .inline-bar-msg { flex: 1; }
+    .inline-bar-ok { background: var(--aura-color-primary); color: var(--aura-color-bg); border-color: transparent; }
+    .inline-bar-ok[data-danger="true"] { background: var(--aura-color-danger); }
+    .roles-editor .inline-bar { border: 1px solid var(--aura-color-border); border-radius: 10px; margin-bottom: 12px; }
+
+    /* Tabs: profile sections | divider | Global. */
+    .settings-tabs {
+      display: flex; align-items: stretch; gap: 2px; flex: 0 0 auto;
+      padding: 0 10px; overflow-x: auto; scrollbar-width: none;
+      border-bottom: 1px solid var(--aura-color-border);
+    }
+    .settings-tab {
+      font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; white-space: nowrap;
+      padding: 10px 10px 8px; border: none; border-bottom: 2px solid transparent;
+      background: transparent; color: var(--aura-color-text-dim);
+    }
+    .settings-tab:hover { color: var(--aura-color-text); }
+    .settings-tab[aria-selected="true"] { color: var(--aura-color-primary); border-bottom-color: var(--aura-color-primary); }
+    .settings-tabs-sep { flex: 0 0 1px; margin: 9px 6px; background: var(--aura-color-border); }
+    .settings-panel { display: none; flex-direction: column; gap: 14px; }
+    .settings-panel[data-active="true"] { display: flex; }
+    .panel-note { margin: 0; font-size: 12px; color: var(--aura-color-text-dim); }
+
+    .badge {
+      font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 999px; white-space: nowrap;
+      border: 1px solid var(--aura-color-border); color: var(--aura-color-text-dim);
+    }
+    .badge-on, .badge[data-state="editable"] { background: var(--aura-color-success); color: var(--aura-color-bg); border-color: transparent; }
+    .badge[data-state="frozen"] { background: var(--aura-color-surface-2); }
+
+    /* Roles: select on narrow windows, a side list from 720px. */
+    .roles-layout { display: flex; flex-direction: column; gap: 14px; }
+    .roles-toolbar { display: flex; gap: 8px; align-items: center; }
+    .role-select { flex: 1; min-width: 0; }
+    .roles-toolbar .btn { display: inline-flex; align-items: center; gap: 4px; flex: 0 0 auto; }
+    .roles-list { display: none; }
+    .roles-editor { flex: 1; min-width: 0; }
+    .role-empty, .role-card { display: none; }
+    .role-empty[data-show="true"] {
+      display: flex; flex-direction: column; align-items: flex-start; gap: 10px;
+      padding: 16px; border: 1px dashed var(--aura-color-border); border-radius: 12px;
+      color: var(--aura-color-text-dim); font-size: 13px;
+    }
+    .role-empty p { margin: 0; }
+    .role-empty .btn { display: inline-flex; align-items: center; gap: 4px; }
+    .role-card[data-show="true"] {
+      display: flex; flex-direction: column; gap: 12px;
+      padding: 14px; border: 1px solid var(--aura-color-border); border-radius: 12px;
+      background: var(--aura-color-surface);
+    }
+    .role-card-head { display: flex; align-items: center; gap: 8px; }
+    .role-name { font-size: 15px; font-weight: 700; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    [data-role="role-active-badge"][data-show="false"],
+    [data-action="role-activate"][data-show="false"] { display: none; }
+    .version-row { display: flex; align-items: flex-end; gap: 8px; flex-wrap: wrap; }
+    .version-pick { display: flex; flex-direction: column; gap: 4px; }
+    .version-select { min-width: 120px; }
+    .version-row .badge { margin-bottom: 8px; }
+    .version-actions { display: flex; gap: 6px; margin-left: auto; }
+    .version-actions .btn { display: inline-flex; align-items: center; gap: 4px; }
+    .role-text { min-height: 200px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; line-height: 1.5; }
+    .role-text[readonly] { opacity: 0.75; cursor: default; }
+
+    @media (min-width: 720px) {
+      .roles-layout { flex-direction: row; align-items: flex-start; }
+      .roles-nav { flex: 0 0 200px; display: flex; flex-direction: column; gap: 8px; }
+      .role-select { display: none; }
+      .roles-toolbar { justify-content: flex-end; }
+      .roles-list { display: flex; flex-direction: column; gap: 4px; }
+      .roles-list-item {
+        font: inherit; text-align: left; cursor: pointer;
+        display: flex; flex-direction: column; gap: 2px;
+        padding: 8px 10px; border-radius: 8px; border: 1px solid transparent;
+        background: transparent; color: var(--aura-color-text);
+      }
+      .roles-list-item:hover { background: var(--aura-color-surface-2); }
+      .roles-list-item[data-selected="true"] { background: var(--aura-color-surface-2); border-color: var(--aura-color-primary); }
+      .roles-list-name { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .roles-list-meta { font-size: 11px; color: var(--aura-color-text-dim); }
+      .roles-list-item[data-active="true"] .roles-list-meta { color: var(--aura-color-success); }
+    }
+    .settings-foot {
+      display: flex; align-items: center; justify-content: flex-end; gap: 10px; flex: 0 0 auto;
+      padding: 10px 14px; border-top: 1px solid var(--aura-color-border);
+      background: var(--aura-color-surface);
+    }
+    .settings-foot .call-btn { flex: 0 0 auto; }
+    .settings-foot-msg { flex: 1; font-size: 13px; font-weight: 600; }
+    /* Normal mode: Cancel + Save. Confirm mode: message + Keep editing + Discard. */
+    .settings-foot-msg,
+    .settings-foot [data-action="settings-keep"],
+    .settings-foot [data-action="settings-discard"] { display: none; }
+    .settings-foot[data-confirm="true"] .settings-foot-msg,
+    .settings-foot[data-confirm="true"] [data-action="settings-keep"],
+    .settings-foot[data-confirm="true"] [data-action="settings-discard"] { display: inline-flex; }
+    .settings-foot[data-confirm="true"] [data-action="settings-close"],
+    .settings-foot[data-confirm="true"] [data-action="settings-save"] { display: none; }
+    .btn-danger { background: var(--aura-color-danger); color: var(--aura-color-bg); border-color: transparent; }
 
     .field { display: flex; flex-direction: column; gap: 6px; }
     .field-label { font-size: 12px; font-weight: 600; color: var(--aura-color-text-dim); }
@@ -2032,7 +3287,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     .mcp-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 6px; }
     .mcp-row { display: flex; gap: 6px; align-items: center; }
     .mcp-url { flex: 1; }
-    .mcp-transport { flex: 0 0 auto; }
+    .mcp-transport, .mcp-behavior { flex: 0 0 auto; }
     .btn-del {
       font: inherit; font-size: 12px; font-weight: 600; cursor: pointer;
       padding: 6px 10px; border-radius: 8px;
