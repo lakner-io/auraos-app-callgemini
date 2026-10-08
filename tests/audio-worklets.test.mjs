@@ -61,3 +61,93 @@ test('clearing playback drops queued speech at a native device rate', () => {
   p.process([], [[block]]);
   assert.ok(block.every((v) => v === 0));
 });
+
+function render(p, blocks = 1) {
+  const output = [];
+  for (let i = 0; i < blocks; i++) {
+    const block = new Float32Array(128);
+    p.process([], [[block]]);
+    output.push(...block);
+  }
+  return output;
+}
+
+function growCushion(p, rate) {
+  // Reproduce the four underruns observed in the user's call: 80→300 ms.
+  for (let i = 0; i < 4; i++) {
+    const samples = p.prime;
+    p.port.onmessage({ data: new Int16Array(samples).fill(16000).buffer });
+    render(p, Math.ceil(samples * rate / 24000 / 128) + 2);
+  }
+  assert.equal(p.prime, 7200);
+  p.port.onmessage({ data: 'clear' });
+  render(p, Math.ceil(rate * 0.02 / 128));
+}
+
+for (const rate of [24000, 44100, 48000]) {
+  test(`a grown jitter cushion is not bypassed while chunks keep arriving (${rate} Hz)`, () => {
+    const { processor: p } = worklet('playback-worklet', rate);
+    growCushion(p, rate);
+    const arrivalEvery = Math.ceil(rate * 0.02 / 128);
+    const output = [];
+    // Supply less than 300 ms of speech over 240 ms. Active delivery must
+    // build the negotiated cushion, not restart early at the old 160 ms cap.
+    for (let b = 0; b < Math.ceil(rate * 0.24 / 128); b++) {
+      if (b % arrivalEvery === 0) p.port.onmessage({ data: new Int16Array(480).fill(16000).buffer });
+      output.push(...render(p));
+    }
+    assert.ok(output.every((v) => Math.abs(v) < 0.001), 'played before the 300 ms cushion was ready');
+    p.port.onmessage({ data: new Int16Array(7200).fill(16000).buffer });
+    assert.ok(render(p, 4).some((v) => v > 0.1), 'did not start after enough audio arrived');
+  });
+
+  test(`an isolated short tail still plays without a flush (${rate} Hz)`, () => {
+    const { processor: p } = worklet('playback-worklet', rate);
+    growCushion(p, rate);
+    p.port.onmessage({ data: new Int16Array(480).fill(16000).buffer });
+    assert.ok(render(p, Math.ceil(rate * 0.25 / 128)).some((v) => v > 0.1));
+  });
+}
+
+test('resuming after a one-sample underrun does not introduce a click', () => {
+  const { processor: p } = worklet('playback-worklet', 24000);
+  p.port.onmessage({ data: new Int16Array(2047).fill(16000).buffer });
+  const before = render(p, 16); // one decaying sample after the queue drains
+  p.port.onmessage({ data: new Int16Array(4000).fill(16000).buffer });
+  const after = render(p);
+  assert.ok(Math.abs(after[0] - before.at(-1)) < 0.05,
+    `resume jumped from ${before.at(-1)} to ${after[0]}`);
+});
+
+test('a flushed short ending plays immediately even with a grown cushion', () => {
+  const { processor: p, messages } = worklet('playback-worklet', 24000);
+  growCushion(p, 24000);
+  const underruns = messages.filter((m) => m?.t === 'underrun').length;
+  p.port.onmessage({ data: new Int16Array(480).fill(16000).buffer });
+  p.port.onmessage({ data: 'flush' });
+  assert.ok(render(p).some((v) => v > 0.1));
+  render(p, 10);
+  assert.equal(messages.filter((m) => m?.t === 'underrun').length, underruns);
+});
+
+test('clearing and immediately replacing speech does not create a waveform step', () => {
+  const { processor: p } = worklet('playback-worklet', 24000);
+  p.port.onmessage({ data: new Int16Array(4000).fill(16000).buffer });
+  const before = render(p, 8);
+  p.port.onmessage({ data: 'clear' });
+  p.port.onmessage({ data: new Int16Array(4000).fill(-16000).buffer });
+  const after = render(p, 2);
+  assert.ok(Math.abs(after[0] - before.at(-1)) < 0.05);
+  assert.ok(after.at(-1) < -0.4, 'replacement speech should finish fading in');
+});
+
+test('playback worklet reports debug stats only when asked', () => {
+  const { processor: p, messages } = worklet('playback-worklet', 24000);
+  growCushion(p, 24000);
+  assert.ok(!messages.some((m) => m?.t === 'stats'), 'stats posted without a request');
+  p.port.onmessage({ data: { t: 'stats?' } });
+  const st = messages.findLast((m) => m?.t === 'stats');
+  assert.equal(st.cushionMs, 300);
+  assert.equal(st.underruns, 4);
+  assert.ok(st.bursts >= 4);
+});

@@ -44,6 +44,9 @@ import { connectAll, createSeenValues, serverBehavior } from './mcp.mjs';
 import { createShadow } from './acp.mjs';
 import { register, unregister } from './sessions.mjs';
 import * as conversations from './conversations.mjs';
+import { tracker, existingTracker, consoleLine, captureConsole } from './debugMetrics.mjs';
+
+captureConsole(); // mirror [callgemini…] log lines for the debug MCP's get_logs
 
 /** Settings-configured servers as last seen in a `start` frame. The app's own
  * MCP server reports them without ever reading the KV config (API key). */
@@ -167,9 +170,10 @@ export class CallSession {
     this.userSpeakingUntil = 0;               // input-transcription activity + grace — "user is speaking"
     this.toolNativeNonBlocking = false;       // hidden experimental flag (see start / mcp.mjs header)
     this.handlePersistedAt = 0;               // last time resumeHandle was written to the store
-    this.resumeUnproven = false;              // current socket was restored from a handle and hasn't completed a turn yet
+    this.freshRecoveryUsed = false;           // at most one fresh recovery after a live request is rejected
     this.speakerMuted = false;                // browser's speaker-silence state (reported by the page)
     this.speakerWaiters = [];                 // set_speaker_muted calls awaiting the page's confirmation
+    this.debugTimer = null;                   // periodic [callgemini/debug] console trace (debug MCP)
     register(this);
 
     ws.on('message', (data, isBinary) => this.onClientMessage(data, isBinary));
@@ -205,6 +209,34 @@ export class CallSession {
     });
   }
 
+  /** Telemetry of the current conversation (debugMetrics.mjs); null before one is set. */
+  get dbg() { return tracker(this.convId); }
+
+  /** Debug MCP: switch detailed telemetry for this call on/off. The page
+   * starts or stops sending { type:'metrics' } frames; `console` adds a
+   * one-line trace per interval to the app log. */
+  setDebug(cfg) {
+    const t = this.dbg;
+    if (!t) return null;
+    t.debug = { ...t.debug, ...cfg };
+    const { enabled, intervalMs, console: toConsole } = t.debug;
+    this.emit({ type: 'debug', on: !!enabled, intervalMs });
+    if (this.debugTimer) { clearInterval(this.debugTimer); this.debugTimer = null; }
+    if (enabled && toConsole) {
+      this.debugTimer = setInterval(() => { if (this.session) console.log(consoleLine(t)); }, Math.max(500, intervalMs));
+      this.debugTimer.unref?.();
+    }
+    t.event('debug', { ...t.debug });
+    return t.debug;
+  }
+
+  /** Browser telemetry frame (only while debug is on). Echo `t` back so the
+   * page can measure the WS round trip. */
+  onClientMetrics(msg) {
+    if (Number.isFinite(msg.t)) this.emit({ type: 'pong', t: msg.t });
+    this.dbg?.clientStats(msg.stats ?? {});
+  }
+
   /** Send a binary (audio) frame to the browser. */
   emitAudio(buf) {
     if (this.closed || this.ws.readyState !== this.ws.OPEN) return;
@@ -214,6 +246,7 @@ export class CallSession {
   async onClientMessage(data, isBinary) {
     if (isBinary) {
       // Mic PCM16 @16 kHz → Gemini. Drop until the session is live.
+      this.dbg?.micFrame(data, !!this.session);
       if (!this.session) return;
       const base64 = Buffer.isBuffer(data)
         ? data.toString('base64')
@@ -232,7 +265,9 @@ export class CallSession {
       case 'start':   this.speakerMuted = !!msg.speakerMuted; await this.start(msg.config ?? {}, msg.conversationId, msg.mcp); break;
       case 'speaker': this.onSpeakerReport(!!msg.muted); break;
       case 'text':    this.sendText(msg.text ?? ''); break;
-      case 'vad':     this.sendActivitySignal(msg.event); break;
+      case 'vad':     this.dbg?.vad(msg.event); this.sendActivitySignal(msg.event); break;
+      case 'playback': this.dbg?.playback(msg.state === 'playing' ? 'playing' : 'idle'); break;
+      case 'metrics': this.onClientMetrics(msg); break;
       case 'mcp':     await this.applyMcpChange({ disabled: msg.disabled, skipped: msg.skipped, ...(Array.isArray(msg.temporary) ? { temporary: msg.temporary } : {}), why: 'ui' }); break;
       case 'stop':    this.stopGemini('user-stop'); break;
       default: break;
@@ -374,6 +409,7 @@ export class CallSession {
       this.liveConfig = liveConfig;
       this.userStopped = false;
       this.reconnectTries = 0;
+      this.freshRecoveryUsed = false;
       this.resumeHandle = null;
       this.handlePersistedAt = 0;
       // Continue a saved conversation with its REAL context when we hold a
@@ -583,6 +619,12 @@ export class CallSession {
    * setup (bad key, bad handle, bad tool schema) arrives as a CLOSE instead, so
    * the connect is raced against it — otherwise the call would hang forever. */
   async connectGemini(resumeHandle, baseConfig = this.liveConfig) {
+    if (this.closed || this.userStopped) return;
+    this.dbg?.dial({
+      resumed: !!resumeHandle,
+      tools: baseConfig?.tools?.[0]?.functionDeclarations?.length ?? 0,
+      sysChars: String(baseConfig?.systemInstruction ?? '').length,
+    });
     const config = resumeHandle
       ? { ...baseConfig, sessionResumption: { handle: resumeHandle } }
       : baseConfig;
@@ -598,7 +640,9 @@ export class CallSession {
       closedDuringSetup.catch(() => {}); // settled by the race; never unhandled
       let mine = null; // the Session object once connected
       const callbacks = {
-        onopen: () => { this.reconnectTries = 0; },
+        // A socket opening doesn't prove recovery worked. Only a completed
+        // turn resets the retry budget; otherwise repeated drops loop forever.
+        onopen: () => {},
         onmessage: (message) => { if (!mine || this.session === mine) this.onServerMessage(message); },
         onerror: (e) => { if (!mine || this.session === mine) this.emit({ type: 'status', state: 'error', message: e?.message ?? 'Gemini stream error' }); },
         onclose: (e) => {
@@ -609,7 +653,7 @@ export class CallSession {
             return;
           }
           if (this.session !== mine) return; // stale socket (replaced or already torn down)
-          this.onGeminiClose(e);
+          return this.onGeminiClose(e);
         },
       };
       return Promise.race([
@@ -622,58 +666,75 @@ export class CallSession {
     } catch (err) {
       // The thinking guard keys off the model id; if this id doesn't actually
       // support thinking the API rejects the config — retry once without it.
+      if (this.closed || this.userStopped) return;
       if (!config.thinkingConfig) throw err;
       console.error('[callgemini] connect with thinkingConfig failed, retrying without:', err?.message ?? err);
       const { thinkingConfig, ...rest } = config;
       this.session = await dial(rest);
     }
+    // Stop may have arrived while the SDK waited for setupComplete.
+    if (this.closed || this.userStopped) {
+      const late = this.session;
+      this.session = null;
+      try { late?.close?.(); } catch { /* already closed */ }
+      return;
+    }
     this.handlePersistedAt = 0; // persist the first handle of this socket right away
-    this.resumeUnproven = !!resumeHandle;
     // Only now is `this.session` set. Announcing 'live' from onopen (earlier)
     // let a text/vad frame sent right after 'live' hit the `!this.session`
     // guards and vanish silently.
     this.emit({ type: 'status', state: 'live' });
+    this.dbg?.live();
+    // A call that starts (or resumes) with debug already on re-arms the page.
+    const dbgState = existingTracker(this.convId)?.debug;
+    if (dbgState?.enabled) this.setDebug({});
+  }
+
+  /** A 1007 may reject expired/inconsistent state even AFTER completed turns.
+   * Retry once without server-side state, retaining the transcript and setup.
+   * Do not silently remove tools or change the user's model/voice. */
+  async recoverFresh() {
+    if (this.closed || this.userStopped || this.freshRecoveryUsed) return;
+    this.freshRecoveryUsed = true;
+    this.resumeHandle = null;
+    this.flushTurn();
+    console.warn('[callgemini] live request rejected — dropping resumption state, trying fresh once');
+    this.emit({ type: 'status', state: 'reconnecting', message: 'Gemini rejected the session. Reconnecting with saved conversation…' });
+    try {
+      let turns = [];
+      if (this.convId) {
+        // Store mutations are serialized: this also waits for flushTurn above.
+        await conversations.update(this.convId, { resumeHandle: null });
+        turns = (await conversations.get(this.convId))?.turns ?? [];
+      }
+      if (this.closed || this.userStopped) return;
+      await this.connectFresh(turns);
+    } catch (err) {
+      if (this.closed || this.userStopped) return;
+      console.error('[callgemini] fresh recovery failed:', err?.message ?? err);
+      this.emit({ type: 'status', state: 'error', message: `Could not recover the Gemini call: ${err?.message ?? err}. Try a new call; if it repeats, check the model, voice, and enabled MCP tools in Settings.` });
+      this.emit({ type: 'status', state: 'ended' });
+    }
   }
 
   /** Gemini socket closed. Intentional (user stop / teardown) → today's clean
    * end. Unexpected + we hold a resumption handle → bounded auto-resume. */
   onGeminiClose(event) {
     this.session = null;
+    this.dbg?.closed(event?.code, event?.reason ? String(event.reason) : '');
     // A tool-change re-dial closes the socket itself and reconnects right after.
     if (this.closed || this.userStopped || this.retooling) return;
-    // A non-normal close carries the server's reason (e.g. 1007 = the setup
-    // payload was rejected — typically an MCP tool schema Gemini can't parse).
+    // A non-normal close carries the server's reason. 1007 can reject setup,
+    // resumed state, or live input; it does not identify the offending field.
     // Log it and hand it to the browser, otherwise the call ends with no clue.
     const code = event?.code;
     const reason = event?.reason ? String(event.reason) : '';
     if (code && code !== 1000 && code !== 1005) {
       console.error(`[callgemini] Gemini socket closed (code ${code})${reason ? `: ${reason}` : ''}`);
     }
-    // A restored session can pass setup and still be rejected on first use
-    // (seen after the app died mid-call: 1007 "invalid argument" every time
-    // that conversation was continued). Drop the handle and start fresh with
-    // the transcript replayed, instead of ending the call — once.
-    if (code === 1007 && this.resumeUnproven) {
-      this.resumeUnproven = false;
-      this.resumeHandle = null;
-      console.error('[callgemini] resumed session rejected on first use — dropping handle, starting fresh');
-      this.emit({ type: 'status', state: 'reconnecting' });
-      (async () => {
-        let turns = [];
-        if (this.convId) {
-          await conversations.update(this.convId, { resumeHandle: null }).catch(() => {});
-          turns = (await conversations.get(this.convId).catch(() => null))?.turns ?? [];
-        }
-        await this.connectFresh(turns);
-      })().catch((err) => {
-        console.error('[callgemini] fresh re-dial after rejected resume failed:', err?.message ?? err);
-        this.emit({ type: 'status', state: 'error', message: `Gemini rejected the session (${code}): ${reason || 'no reason given'}` });
-        this.emit({ type: 'status', state: 'ended' });
-      });
-      return;
-    }
+    if (code === 1007 && !this.freshRecoveryUsed) return this.recoverFresh();
     if (code === 1007 || code === 1008 || code === 1003) {
-      this.emit({ type: 'status', state: 'error', message: `Gemini rejected the session (${code}): ${reason || 'no reason given'}` });
+      this.emit({ type: 'status', state: 'error', message: `Gemini rejected the session (${code}): ${reason || 'no reason given'}${code === 1007 ? ' Automatic recovery was already attempted. Try a new call; if it repeats, check the model, voice, and enabled MCP tools in Settings.' : ''}` });
       this.emit({ type: 'status', state: 'ended' });
       return;
     }
@@ -682,7 +743,10 @@ export class CallSession {
       this.emit({ type: 'status', state: 'reconnecting' });
       console.log(`[callgemini] Gemini socket dropped — resuming (try ${this.reconnectTries})`);
       this.connectGemini(this.resumeHandle).catch((err) => {
+        if (this.closed || this.userStopped) return;
         console.error('[callgemini] session resume failed:', err?.message ?? err);
+        if (err?.code === 1007 && !this.freshRecoveryUsed) return this.recoverFresh();
+        this.emit({ type: 'status', state: 'error', message: err?.message ?? 'Could not reconnect to Gemini' });
         this.emit({ type: 'status', state: 'ended' });
       });
       return;
@@ -700,11 +764,13 @@ export class CallSession {
       this.persistHandle();
     }
     if (message?.goAway) {
+      this.dbg?.event('goAway', { timeLeft: message.goAway.timeLeft ?? null });
       console.log('[callgemini] Gemini goAway received (timeLeft:', message.goAway.timeLeft ?? '?', ') — will auto-resume');
     }
 
     const sc = message?.serverContent;
     if (sc?.inputTranscription?.text) {
+      this.dbg?.userTranscript();
       this.seen.note(sc.inputTranscription.text); // what the user said is never "invented"
       this.userSpeakingUntil = Date.now() + 1500; // hold deferred injections while the user talks
       this.emit({ type: 'transcript', role: 'user', text: sc.inputTranscription.text });
@@ -717,13 +783,19 @@ export class CallSession {
     if (sc?.modelTurn?.parts) {
       for (const part of sc.modelTurn.parts) {
         const inline = part?.inlineData;
-        if (inline?.data) this.emitAudio(Buffer.from(inline.data, 'base64'));
+        if (inline?.data) {
+          const pcm = Buffer.from(inline.data, 'base64');
+          this.dbg?.downChunk(pcm.length);
+          this.emitAudio(pcm);
+        }
         // Text parts are rare in AUDIO mode (transcription covers it) but forward if present.
         else if (part?.text) { this.emit({ type: 'transcript', role: 'model', text: part.text }); this.accrue('model', part.text); }
       }
     }
+    if (sc?.interrupted) this.dbg?.interrupted();
+    if (sc?.turnComplete) this.dbg?.turnComplete();
     if (sc?.interrupted) { this.emit({ type: 'interrupted' }); this.userSpeakingUntil = Date.now() + 1500; } // barge-in = user speaking
-    if (sc?.turnComplete) { this.resumeUnproven = false; this.emit({ type: 'turnComplete' }); this.flushTurn(); this.maybeInjectToolResults(); }
+    if (sc?.turnComplete) { this.reconnectTries = 0; this.emit({ type: 'turnComplete' }); this.flushTurn(); this.maybeInjectToolResults(); }
 
     if (message?.toolCall?.functionCalls?.length) {
       this.handleToolCalls(message.toolCall.functionCalls);
@@ -778,9 +850,11 @@ export class CallSession {
     functionCalls.forEach((fc, i) => {
       this.emit({ type: 'tool', name: fc.name, phase: 'running' });
       this.noteToolCall(fc.name);
+      const toolStartedAt = this.dbg?.toolStart(fc.name) ?? Date.now();
       console.log(`[callgemini/tool] ${fc.name} args:`, JSON.stringify(fc.args ?? {}).slice(0, 300));
       outcomes[i]
         .then((response) => {
+          this.dbg?.toolEnd(fc.name, toolStartedAt, response);
           // Server-side trace of every tool round-trip: the outcome otherwise
           // only reaches Gemini (and the transcript chip), so a failing tool is
           // invisible in the app logs.
@@ -903,6 +977,7 @@ export class CallSession {
   close(_reason) {
     if (this.closed) return;
     this.closed = true;
+    if (this.debugTimer) { clearInterval(this.debugTimer); this.debugTimer = null; }
     if (this.injectTimer) { clearTimeout(this.injectTimer); this.injectTimer = null; }
     this.pendingToolResults = [];
     this.flushTurn(); // don't lose the last utterance on a hard socket drop

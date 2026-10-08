@@ -17,7 +17,7 @@
  * Declick: dry-outs used to jump from a live sample straight to 0 and resume
  * with another hard edge — two clicks framing every hole. Now a dry-out decays
  * the last rendered sample exponentially (~2 ms tail, no lookahead needed) and
- * every resume-from-silence ramps in over ~5 ms.
+ * every resume ramps in from the remaining tail over ~5 ms.
  *
  * Messages from the main thread:
  *   • ArrayBuffer  — a chunk of Int16 PCM @24 kHz to enqueue.
@@ -52,14 +52,27 @@ class PlaybackProcessor extends AudioWorkletProcessor {
     this.prime = PRIME_START; // adaptive cushion size, grows on underruns
     this.primed = false;  // burst gate: wait for the cushion before starting
     this.flushed = false; // last drain was an intentional end-of-turn flush
-    this.stall = 0;       // blocks spent waiting while audio is queued
+    this.stall = 0;       // blocks without new input while audio is queued
     this.playing = false; // audible right now — transitions posted to main
     this.last = 0;        // last rendered sample — decayed through dry-outs
+    this.fadeFrom = 0;    // continuity anchor when resuming a short gap
     this.ramp = 0;        // samples since resume, for the fade-in
     this.lvlSum = 0;      // level accumulator (sum of squares / sample count)
     this.lvlN = 0;
     this.lvlBlocks = 0;
+    // Debug counters — read only on a { t:'stats?' } request (debug MCP).
+    this.underruns = 0;   // mid-burst dry-outs, including those at the cap
+    this.dryBlocks = 0;   // blocks rendered with nothing to play mid-burst
+    this.bursts = 0;      // bursts started (cushion filled → playing)
     this.port.onmessage = (e) => {
+      if (e.data && e.data.t === 'stats?') {
+        this.port.postMessage({
+          t: 'stats', queuedMs: Math.round(this.queued / 24), cushionMs: Math.round(this.prime / 24),
+          primed: this.primed, playing: this.playing, underruns: this.underruns,
+          dryMs: Math.round(this.dryBlocks * 128 * 1000 / sampleRate), bursts: this.bursts,
+        });
+        return;
+      }
       if (e.data === 'clear') {
         this.queue = [];
         this.queued = 0;
@@ -68,6 +81,7 @@ class PlaybackProcessor extends AudioWorkletProcessor {
         this.primed = false;
         this.flushed = true; // intentional drain — never an underrun
         this.stall = 0;
+        this.ramp = 0;
         this.setPlaying(false);
         return;
       }
@@ -82,6 +96,10 @@ class PlaybackProcessor extends AudioWorkletProcessor {
       this.queue.push(f);
       this.queued += f.length;
       this.flushed = false;
+      // The short-tail failsafe measures delivery silence, not total buffering
+      // time. Otherwise it bypasses an adaptive 200–300 ms cushion at 160 ms
+      // even while chunks keep arriving, causing repeated premature restarts.
+      this.stall = 0;
       if (this.queued >= this.prime) this.primed = true;
     };
   }
@@ -96,8 +114,8 @@ class PlaybackProcessor extends AudioWorkletProcessor {
   process(_inputs, outputs) {
     const out = outputs[0][0];
     if (!out) return true;
-    // Failsafe: if audio is queued but the cushion never fills (a tail burst
-    // with no 'flush'), start anyway after ~160 ms rather than sitting silent.
+    // Failsafe for a short tail with no 'flush': start after ~160 ms without
+    // new input. Active delivery continues to build the full adaptive cushion.
     if (!this.primed && this.queue.length) {
       if (++this.stall >= STALL_BLOCKS) this.primed = true;
     } else {
@@ -114,6 +132,7 @@ class PlaybackProcessor extends AudioWorkletProcessor {
           if (this.cur) {
             // Just ran out. Mid-burst (no flush/clear) = a real underrun the
             // listener would hear as a cut — grow the cushion for this call.
+            if (!this.flushed) this.underruns++;
             if (!this.flushed && this.prime < PRIME_MAX) {
               this.prime = Math.min(PRIME_MAX, this.prime + PRIME_STEP);
               this.port.postMessage({ t: 'underrun', cushionMs: Math.round(this.prime / 24) });
@@ -136,8 +155,15 @@ class PlaybackProcessor extends AudioWorkletProcessor {
           : (this.queue[0]?.[0] ?? a);
         s = a + (b - a) * fraction;
         this.curPos += this.sourceStep;
-        // Resume declick: ~5 ms linear ramp after any silence.
-        if (this.ramp < FADE_IN) { s *= this.ramp / FADE_IN; this.ramp++; }
+        // Resume from the actual decaying tail, not from an artificial zero.
+        // A brief underrun can leave a large tail; dropping it to zero at
+        // the next chunk's first sample creates the very click we avoid.
+        if (this.ramp === 0) this.fadeFrom = this.last;
+        if (this.ramp < FADE_IN) {
+          const mix = this.ramp / FADE_IN;
+          s = this.fadeFrom * (1 - mix) + s * mix;
+          this.ramp++;
+        }
         this.last = s;
       } else {
         // Dry declick: decay the last sample toward 0 instead of jumping.
@@ -150,6 +176,8 @@ class PlaybackProcessor extends AudioWorkletProcessor {
       this.lvlSum = (this.lvlSum ?? 0) + s * s;
     }
     this.lvlN = (this.lvlN ?? 0) + out.length;
+    if (this.cur === null && this.queue.length && !this.flushed) this.dryBlocks++;
+    if (this.cur !== null && !this.playing) this.bursts++;
     this.setPlaying(this.cur !== null);
     // Throttled level report (~43 ms) while audible — drives the button glow.
     if (this.playing && ++this.lvlBlocks >= Math.ceil(sampleRate * 0.043 / 128)) {

@@ -48,6 +48,9 @@
  */
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+
+/** Cap on the text of one tool result handed to Gemini. */
+const MAX_RESULT_CHARS = 6000;
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 
@@ -460,6 +463,12 @@ export async function connectAll(servers = [], {
         if (ignored.length) {
           text += `${text ? '\n\n' : ''}(Ignored undeclared argument(s): ${ignored.join(', ')}. ` +
             `This tool only accepts: ${Object.keys(route.properties ?? {}).join(', ') || 'no arguments'}.)`;
+        }
+        // A voice model re-reads every result on each later turn: a 25 KB dump
+        // (list_interfaces) made replies slow for the rest of the call.
+        if (text.length > MAX_RESULT_CHARS) {
+          text = `${text.slice(0, MAX_RESULT_CHARS)}\n\n(Result truncated: ${text.length} chars, ` +
+            `showing the first ${MAX_RESULT_CHARS}. Ask a narrower question if you need the rest.)`;
         }
         if (res?.isError) return { error: text || 'tool reported an error' };
         return { result: text || 'ok' };

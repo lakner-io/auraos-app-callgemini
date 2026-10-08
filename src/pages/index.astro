@@ -798,6 +798,60 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       endCall('reconnect-failed');
     }
 
+    // ── Debug telemetry (callgemini-debug MCP → set_debug_logging) ───────────
+    // Off by default. When the server sends { type:'debug', on:true } the page
+    // reports mic level, VAD, playback-worklet stats, output latency, WS
+    // backlog and RTT every intervalMs as { type:'metrics' }.
+    let debugTimer = null;
+    let dbgRtt = null;                 // last WS round trip (ms), via pong
+    let dbgMic = { sum: 0, n: 0, peak: 0 };
+    let dbgVadProb = null;
+    let dbgPlayback = null;            // last { t:'stats' } from the playback worklet
+
+    function setDebugTelemetry(on, intervalMs = 1000) {
+      if (debugTimer) { clearInterval(debugTimer); debugTimer = null; }
+      if (!on) return;
+      debugTimer = setInterval(sendDebugMetrics, Math.max(250, intervalMs));
+    }
+
+    function sendDebugMetrics() {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      playbackNode?.port.postMessage({ t: 'stats?' }); // answer lands in dbgPlayback for the next tick
+      const ctx = playbackCtx;
+      const stats = {
+        micRms: dbgMic.n ? Math.round(dbgMic.sum / dbgMic.n) : null,
+        micPeak: dbgMic.peak,
+        micMuted: !!muted,
+        noiseProb: micNp >= 0 ? Math.round(micNp * 100) / 100 : null,
+        vadEngine: vadEngineKind ?? 'server',
+        vadSpeaking: !!vadSpeaking,
+        vadProb: dbgVadProb == null ? null : Math.round(dbgVadProb * 100) / 100,
+        modelSpeaking: !!modelSpeaking,
+        modelLevel: Math.round(modelLevel * 1000) / 1000,
+        playback: dbgPlayback,
+        contextState: ctx?.state ?? null,
+        sampleRate: ctx?.sampleRate ?? null,
+        baseLatencyMs: ctx?.baseLatency != null ? Math.round(ctx.baseLatency * 1000) : null,
+        outputLatencyMs: ctx?.outputLatency != null ? Math.round(ctx.outputLatency * 1000) : null,
+        wsBufferedBytes: ws.bufferedAmount,
+        rttMs: dbgRtt,
+        hidden: document.hidden,
+      };
+      dbgMic = { sum: 0, n: 0, peak: 0 };
+      try { ws.send(JSON.stringify({ type: 'metrics', t: performance.now(), stats })); } catch { /* noop */ }
+    }
+
+    /** Mic level for the debug stats — only computed while debug is on. */
+    function noteDebugMic(buf) {
+      if (!debugTimer) return;
+      const pcm = new Int16Array(buf);
+      let sum = 0, peak = dbgMic.peak;
+      for (let i = 0; i < pcm.length; i++) { const v = pcm[i]; sum += v * v; if (v > peak) peak = v; else if (-v > peak) peak = -v; }
+      dbgMic.sum += pcm.length ? Math.sqrt(sum / pcm.length) : 0;
+      dbgMic.n++;
+      dbgMic.peak = peak;
+    }
+
     function onWsMessage(ev) {
       if (typeof ev.data !== 'string') {
         if (playbackNode) playbackNode.port.postMessage(ev.data, [ev.data]);
@@ -830,6 +884,12 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
           activeConversationId = msg.id;
           updateActiveConvHighlight();
           scheduleConvRefresh();
+          break;
+        case 'debug':
+          setDebugTelemetry(!!msg.on, msg.intervalMs);
+          break;
+        case 'pong':
+          if (Number.isFinite(msg.t)) dbgRtt = Math.round(performance.now() - msg.t);
           break;
         case 'speaker':
           // Silence/unsilence from the app's MCP server (set_speaker_muted).
@@ -1048,6 +1108,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     }
 
     function onVadProb(prob, windowMs) {
+      dbgVadProb = prob;
       if (!vadSpeaking) {
         // Echo guard: while Gemini's audio is audible the bar is higher, so
         // speaker bleed into the mic can't trigger us — a real interjection
@@ -1126,6 +1187,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
 
     function onMicFrame(buf, np = -1) {
       if (muted) { userLevel = 0; return; }
+      noteDebugMic(buf);
       micNp = np;
       // Badge honesty: if the fallback energy tier is being driven by RNNoise
       // probs, say so (once, when the first denoised frame proves it's live).
@@ -1330,13 +1392,18 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     function toggleSpeaker() { setSpeakerMuted(!speakerMuted); }
 
     async function startPlayback(audio) {
-      await audio.context.audioWorklet.addModule('worklets/playback-worklet.js?v=shared-native-v1');
+      await audio.context.audioWorklet.addModule('worklets/playback-worklet.js?v=adaptive-buffer-v3-stats');
       audio.assertActive();
       playbackNode = new AudioWorkletNode(playbackCtx, 'playback-worklet');
       // The worklet reports exactly when model audio is audible — this drives
       // the software echo guard (stricter barge-in / server-mode mic gating)
       // and, via the level reports, the call button's audio-reactive glow.
       playbackNode.port.onmessage = (e) => {
+        if (e.data === 'playing' || e.data === 'idle') {
+          // Audible / silent edges feed the debug trace (first-audible latency).
+          try { ws?.readyState === WebSocket.OPEN && ws.send(JSON.stringify({ type: 'playback', state: e.data })); } catch { /* noop */ }
+        }
+        if (e.data && e.data.t === 'stats') { const { t: _t, ...st } = e.data; dbgPlayback = st; return; }
         if (e.data === 'playing') { modelSpeaking = true; return; }
         if (e.data === 'idle') {
           modelSpeaking = false;
@@ -1563,6 +1630,8 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     function endCall(_reason) {
       if (!inCall) return;
       inCall = false;
+      setDebugTelemetry(false);
+      dbgPlayback = null; dbgRtt = null;
       try { ws?.readyState === WebSocket.OPEN && ws.send(JSON.stringify({ type: 'stop' })); } catch { /* noop */ }
       try { ws?.close(); } catch { /* noop */ }
       ws = null;
