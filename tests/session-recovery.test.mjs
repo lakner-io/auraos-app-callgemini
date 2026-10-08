@@ -160,3 +160,12 @@ test('Stop while saved history loads prevents a fresh dial', async (t) => {
   assert.equal(call.session, null);
   assert.equal(events.at(-1).state, 'idle');
 });
+
+test('a tool call tells the page to play out its queue (toolPause) before the tool runs', async (t) => {
+  const { call, events, dials } = harness(t);
+  await call.connectGemini();
+  dials[0].callbacks.onmessage({ toolCall: { functionCalls: [{ id: 'c1', name: 'get_x', args: {} }] } });
+  const i = events.findIndex((e) => e.type === 'toolPause');
+  assert.ok(i >= 0, 'no toolPause event');
+  assert.ok(i < events.findIndex((e) => e.type === 'tool'), 'toolPause must come before the tool chip');
+});

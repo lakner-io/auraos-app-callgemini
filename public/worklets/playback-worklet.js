@@ -11,8 +11,11 @@
  * and GROWS +60 ms after every mid-burst underrun — a dry-out while audibly
  * mid-sentence, the thing the listener hears as a cut — up to ~300 ms, so a
  * call on a jittery network trades a little latency for stability while a
- * clean call stays snappy. A drain right after 'flush' (end of turn) is
- * normal and never counts as an underrun.
+ * clean call stays snappy. A drain right after 'flush' (end of turn, or
+ * Gemini pausing to call a tool) is normal and never counts as an underrun.
+ * The cushion SHRINKS again (−20 ms per burst, floor ~80 ms) once
+ * DECAY_AFTER bursts in a row have ended cleanly, so one jittery moment
+ * doesn't delay every later reply for the rest of the call.
  *
  * Declick: dry-outs used to jump from a live sample straight to 0 and resume
  * with another hard edge — two clicks framing every hole. Now a dry-out decays
@@ -22,8 +25,9 @@
  * Messages from the main thread:
  *   • ArrayBuffer  — a chunk of Int16 PCM @24 kHz to enqueue.
  *   • 'clear'      — flush the queue immediately (barge-in / interruption).
- *   • 'flush'      — play out whatever is queued now (end of a model turn,
- *                    where the final burst may be smaller than the cushion).
+ *   • 'flush'      — play out whatever is queued now (end of a model turn, or
+ *                    a tool call pause; the final burst may be smaller than
+ *                    the cushion). The drain that follows is intentional.
  * Messages to the main thread:
  *   • 'playing' / 'idle' — posted on transitions so the controller knows
  *     EXACTLY when model audio is audible (drives the software echo guard:
@@ -37,6 +41,8 @@
 const PRIME_START = 1920;     // ~80 ms @ 24 kHz — first-word latency floor
 const PRIME_STEP = 1440;      // +60 ms per mid-burst underrun
 const PRIME_MAX = 7200;       // ~300 ms cap
+const PRIME_DECAY = 480;      // −20 ms per clean burst once the streak is long enough
+const DECAY_AFTER = 2;        // clean bursts in a row before the cushion shrinks
 const STALL_BLOCKS = Math.ceil(sampleRate * 0.16 / 128);
 const FADE_IN = Math.round(128 * sampleRate / 24000);
 const TAIL_DECAY = Math.pow(0.9, 24000 / sampleRate);
@@ -64,6 +70,8 @@ class PlaybackProcessor extends AudioWorkletProcessor {
     this.underruns = 0;   // mid-burst dry-outs, including those at the cap
     this.dryBlocks = 0;   // blocks rendered with nothing to play mid-burst
     this.bursts = 0;      // bursts started (cushion filled → playing)
+    this.burstUnderrun = false; // this burst dried out mid-way at least once
+    this.cleanStreak = 0;       // bursts in a row that ended without an underrun
     this.port.onmessage = (e) => {
       if (e.data && e.data.t === 'stats?') {
         this.port.postMessage({
@@ -82,6 +90,7 @@ class PlaybackProcessor extends AudioWorkletProcessor {
         this.flushed = true; // intentional drain — never an underrun
         this.stall = 0;
         this.ramp = 0;
+        this.burstUnderrun = false; // its underruns already reset the clean streak
         this.setPlaying(false);
         return;
       }
@@ -102,6 +111,17 @@ class PlaybackProcessor extends AudioWorkletProcessor {
       this.stall = 0;
       if (this.queued >= this.prime) this.primed = true;
     };
+  }
+
+  /** A burst played out after 'flush': count it, and shrink a grown cushion
+   * once enough bursts in a row were clean. */
+  endBurst() {
+    if (this.burstUnderrun) {
+      this.cleanStreak = 0;
+    } else if (++this.cleanStreak >= DECAY_AFTER && this.prime > PRIME_START) {
+      this.prime = Math.max(PRIME_START, this.prime - PRIME_DECAY);
+    }
+    this.burstUnderrun = false;
   }
 
   setPlaying(v) {
@@ -132,7 +152,8 @@ class PlaybackProcessor extends AudioWorkletProcessor {
           if (this.cur) {
             // Just ran out. Mid-burst (no flush/clear) = a real underrun the
             // listener would hear as a cut — grow the cushion for this call.
-            if (!this.flushed) this.underruns++;
+            if (!this.flushed) { this.underruns++; this.burstUnderrun = true; this.cleanStreak = 0; }
+            else if (this.queue.length === 0) this.endBurst();
             if (!this.flushed && this.prime < PRIME_MAX) {
               this.prime = Math.min(PRIME_MAX, this.prime + PRIME_STEP);
               this.port.postMessage({ t: 'underrun', cushionMs: Math.round(this.prime / 24) });

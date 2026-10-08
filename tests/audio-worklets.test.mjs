@@ -151,3 +151,48 @@ test('playback worklet reports debug stats only when asked', () => {
   assert.equal(st.underruns, 4);
   assert.ok(st.bursts >= 4);
 });
+
+/** One burst: `ms` of audio, then 'flush', then render until it has played out. */
+function cleanBurst(p, ms = 400) {
+  p.port.onmessage({ data: new Int16Array(ms * 24).fill(16000).buffer });
+  p.port.onmessage({ data: 'flush' });
+  render(p, Math.ceil(ms * 24 / 128) + 4);
+}
+
+test('a tool-call pause after flush is not an underrun and does not grow the cushion', () => {
+  const { processor: p, messages } = worklet('playback-worklet', 24000);
+  cleanBurst(p);                       // speech before the tool call, then toolPause → flush
+  render(p, Math.ceil(24000 * 0.6 / 128)); // 600 ms tool pause
+  cleanBurst(p);                       // speech after the tool
+  assert.equal(messages.filter((m) => m?.t === 'underrun').length, 0);
+  assert.equal(p.prime, 1920);
+});
+
+test('a grown cushion shrinks after clean bursts, down to the 80 ms floor', () => {
+  const { processor: p } = worklet('playback-worklet', 24000);
+  growCushion(p, 24000);               // 300 ms
+  cleanBurst(p);
+  assert.equal(p.prime, 7200, 'one clean burst is not enough');
+  cleanBurst(p);
+  assert.equal(p.prime, 7200 - 480);   // 280 ms
+  cleanBurst(p);
+  assert.equal(p.prime, 7200 - 960);   // 260 ms
+  for (let i = 0; i < 20; i++) cleanBurst(p);
+  assert.equal(p.prime, 1920);
+});
+
+test('an underrun resets the clean streak', () => {
+  const { processor: p } = worklet('playback-worklet', 24000);
+  growCushion(p, 24000);
+  cleanBurst(p);
+  // A burst that dries out mid-way (no flush), then ends with a flush.
+  p.port.onmessage({ data: new Int16Array(p.prime).fill(16000).buffer });
+  render(p, Math.ceil(p.prime / 128) + 4);
+  p.port.onmessage({ data: new Int16Array(p.prime).fill(16000).buffer });
+  p.port.onmessage({ data: 'flush' });
+  render(p, Math.ceil(p.prime / 128) + 4);
+  cleanBurst(p);
+  assert.equal(p.prime, 7200, 'streak should have restarted after the underrun');
+  cleanBurst(p);
+  assert.equal(p.prime, 7200 - 480);
+});

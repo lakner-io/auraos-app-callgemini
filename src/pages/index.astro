@@ -872,6 +872,11 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
           // Play out any tail audio smaller than the jitter cushion.
           if (playbackNode) playbackNode.port.postMessage('flush');
           break;
+        case 'toolPause':
+          // Gemini paused to call a tool: play out the queue now; the gap
+          // until it speaks again is intentional (no jitter-cushion growth).
+          if (playbackNode) playbackNode.port.postMessage('flush');
+          break;
         case 'interrupted':
           softInterrupt();
           break;
@@ -1392,7 +1397,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     function toggleSpeaker() { setSpeakerMuted(!speakerMuted); }
 
     async function startPlayback(audio) {
-      await audio.context.audioWorklet.addModule('worklets/playback-worklet.js?v=adaptive-buffer-v3-stats');
+      await audio.context.audioWorklet.addModule('worklets/playback-worklet.js?v=adaptive-buffer-v4-decay');
       audio.assertActive();
       playbackNode = new AudioWorkletNode(playbackCtx, 'playback-worklet');
       // The worklet reports exactly when model audio is audible — this drives

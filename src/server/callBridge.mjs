@@ -785,6 +785,10 @@ export class CallSession {
     if (sc?.turnComplete) { this.reconnectTries = 0; this.emit({ type: 'turnComplete' }); this.flushTurn(); this.maybeInjectToolResults(); }
 
     if (message?.toolCall?.functionCalls?.length) {
+      // Gemini stops talking until the tool answers: let the page play out
+      // what it has and treat the gap as a pause, not network jitter.
+      this.emit({ type: 'toolPause' });
+      this.dbg?.event('tool_pause');
       this.handleToolCalls(message.toolCall.functionCalls);
     }
   }
