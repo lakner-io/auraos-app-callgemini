@@ -53,6 +53,12 @@ export function liveConversations() {
   return [...active].filter((s) => s.convId && s.session).map((s) => s.convId);
 }
 
+/** Sessions in a call: Gemini connected, or reconnecting after a drop
+ * (debug MCP — "are we calling right now?"). */
+export function liveSessions() {
+  return [...active].filter((s) => s.convId && !s.closed && (s.session || (s.liveConfig && !s.userStopped)));
+}
+
 /** How many calls are live right now (diagnostics). */
 export function activeCount() {
   return active.size;

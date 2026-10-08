@@ -479,6 +479,10 @@ export async function connectAll(servers = [], {
 
   return {
     functionDeclarations,
+    /** Declared function name → { serverUrl, toolName } (debug MCP). */
+    toolRoutes() {
+      return [...routes].map(([fn, r]) => ({ fn, serverUrl: r.serverUrl, toolName: r.toolName }));
+    },
     /** `[{ url, ok, tools, error? }]` — one entry per configured server. */
     servers: serverReports,
     dispatch,

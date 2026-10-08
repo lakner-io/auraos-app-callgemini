@@ -44,6 +44,7 @@ import { connectAll, createSeenValues, serverBehavior } from './mcp.mjs';
 import { createShadow } from './acp.mjs';
 import { register, unregister } from './sessions.mjs';
 import * as conversations from './conversations.mjs';
+import { historyInstruction } from './history.mjs';
 import { tracker, existingTracker, consoleLine, captureConsole } from './debugMetrics.mjs';
 
 captureConsole(); // mirror [callgemini…] log lines for the debug MCP's get_logs
@@ -89,32 +90,6 @@ const RESPONSIVENESS_MS = { snappy: 350, balanced: 600, relaxed: 1000 };
 const RESUME_HANDLE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 /** Persist a fresh handle at most this often (they arrive every few seconds). */
 const HANDLE_PERSIST_INTERVAL_MS = 20_000;
-
-/** Bound the history carried into a FRESH session's system instruction. Larger
- * than the replay cap: this is the model's only memory of earlier calls when
- * no resumption handle can be used. Newest turns win; one huge line (a tool
- * dump read aloud) can't crowd out the rest. */
-const HISTORY_MAX_TURNS = 60;
-const HISTORY_MAX_CHARS = 16000;
-const HISTORY_MAX_LINE = 1500;
-function historyInstruction(turns) {
-  if (!turns?.length) return '';
-  const lines = [];
-  let total = 0;
-  for (const t of turns.slice(-HISTORY_MAX_TURNS).reverse()) {
-    const text = String(t.text ?? '').trim();
-    if (!text) continue;
-    const clipped = text.length > HISTORY_MAX_LINE ? `${text.slice(0, HISTORY_MAX_LINE)} …` : text;
-    const line = `${t.role === 'model' ? 'Assistant' : 'User'}: ${clipped}`;
-    if (total + line.length > HISTORY_MAX_CHARS && lines.length) break;
-    total += line.length;
-    lines.unshift(line);
-  }
-  if (!lines.length) return '';
-  return '\n\n--- Conversation so far (earlier calls in this same conversation; you remember all of it. ' +
-    'Continue from here — do not greet anew or claim you lack the earlier context) ---\n' +
-    `${lines.join('\n')}\n--- end of conversation so far ---`;
-}
 
 /** Normalise a list of server URLs from the browser (dedup, strings only). */
 function urlList(v) {
@@ -406,6 +381,8 @@ export class CallSession {
     try {
       this.genai = new GoogleGenAI({ apiKey, httpOptions: { apiVersion: 'v1beta' } });
       this.model = model;
+      this.voiceName = voiceName;
+      this.callStartedAt = Date.now();
       this.liveConfig = liveConfig;
       this.userStopped = false;
       this.reconnectTries = 0;
@@ -470,18 +447,20 @@ export class CallSession {
 
   /** Tell the browser where every configured server stands right now. */
   emitMcpReport() {
+    this.emit({ type: 'mcp', servers: this.mcpServerReport() });
+  }
+
+  /** Every server of this call and where it stands (UI sidebar + debug MCP). */
+  mcpServerReport() {
     const live = new Map((this.mcp?.servers ?? []).map((r) => [r.url, r]));
-    this.emit({
-      type: 'mcp',
-      servers: this.allServers.map((s) => {
-        const enabled = !this.mcpDisabled.has(s.url);
-        const r = enabled ? live.get(s.url) : null;
-        return {
-          url: s.url, transport: s.transport ?? 'http', name: s.name ?? '', behavior: serverBehavior(s), temporary: !!s.temporary, enabled, skipped: this.mcpSkipped.has(s.url),
-          ok: r ? r.ok : false, tools: r?.tools ?? 0, ...(r?.error ? { error: r.error } : {}),
-          ...(s.temporary ? { addedAt: s.addedAt ?? null, toolCount: s.toolCount ?? null } : {}),
-        };
-      }),
+    return this.allServers.map((s) => {
+      const enabled = !this.mcpDisabled.has(s.url);
+      const r = enabled ? live.get(s.url) : null;
+      return {
+        url: s.url, transport: s.transport ?? 'http', name: s.name ?? '', behavior: serverBehavior(s), temporary: !!s.temporary, enabled, skipped: this.mcpSkipped.has(s.url),
+        ok: r ? r.ok : false, tools: r?.tools ?? 0, ...(r?.error ? { error: r.error } : {}),
+        ...(s.temporary ? { addedAt: s.addedAt ?? null, toolCount: s.toolCount ?? null } : {}),
+      };
     });
   }
 
@@ -628,6 +607,14 @@ export class CallSession {
     const config = resumeHandle
       ? { ...baseConfig, sessionResumption: { handle: resumeHandle } }
       : baseConfig;
+    // What Gemini is given as context on this dial (debug MCP: get_conversation_context).
+    this.lastDial = {
+      at: Date.now(),
+      resumed: !!resumeHandle,
+      systemInstruction: String(baseConfig?.systemInstruction ?? ''),
+      toolNames: (baseConfig?.tools?.[0]?.functionDeclarations ?? []).map((d) => d.name),
+      slidingWindow: !!baseConfig?.contextWindowCompression?.slidingWindow,
+    };
     // Every dial gets its own callbacks closure. A close event belongs to
     // THAT dial's socket: while it's still connecting, the close is the server
     // rejecting the setup (→ reject the pending connect); once it's live, the

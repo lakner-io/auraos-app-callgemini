@@ -9,14 +9,49 @@
  * detailed stats (mic level, VAD, jitter cushion, RTT) and an optional
  * one-line console trace per interval. Memory only — an app restart clears it.
  */
-import { findByConversation, liveConversations } from './sessions.mjs';
+import { findByConversation, liveConversations, liveSessions } from './sessions.mjs';
 import { CONVERSATION_ID_DESC, ToolError, ok, createToolServer } from './mcpCommon.mjs';
 import * as dm from './debugMetrics.mjs';
+import * as conversations from './conversations.mjs';
+import { historyInstruction, HISTORY_MAX_TURNS, HISTORY_MAX_CHARS, HISTORY_MAX_LINE } from './history.mjs';
+import { getLastConfiguredServers, mergeServers } from './callBridge.mjs';
+
+/** pause / unpause state of mcpControl.mjs (same globalThis anchor). */
+const paused = (globalThis.__callgeminiPaused ??= new Set());
 
 const CONV = { conversation_id: { type: 'string', description: CONVERSATION_ID_DESC + ' Calls that already ended stay inspectable (see list_traced_calls).' } };
 const RO = { readOnlyHint: true, idempotentHint: true };
 
 const TOOLS = [
+  {
+    name: 'get_current_conversation',
+    title: 'Current conversation',
+    description:
+      'Are we calling right now, and which conversation is current: id, title, turn count, last turns; for a ' +
+      'live call also model, voice, Gemini state (live / reconnecting), paused, speaker, declared tools; and the ' +
+      'MCP servers of that Gemini conversation (enabled / skipped / temporary, connected, tool count). Without ' +
+      'conversation_id: the live call, else the most recently updated conversation.',
+    inputSchema: { type: 'object', properties: { ...CONV }, additionalProperties: false },
+    annotations: RO,
+  },
+  {
+    name: 'get_conversation_context',
+    title: 'Conversation context',
+    description:
+      'What Gemini has as context for a conversation: whether the session was resumed (server-side state via ' +
+      'resumption handle) or dialled fresh with the history replayed into the system instruction, the exact ' +
+      'system instruction (incl. replayed history), declared tool names per MCP server, and the transcript.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        max_turns: { type: 'integer', minimum: 1, maximum: 500, description: 'Newest transcript turns to return (default 40).' },
+        include_system_instruction: { type: 'boolean', description: 'Return the full system instruction text (default true).' },
+        ...CONV,
+      },
+      additionalProperties: false,
+    },
+    annotations: RO,
+  },
   {
     name: 'set_debug_logging',
     title: 'Enable / disable live telemetry',
@@ -122,9 +157,113 @@ function resolveTracker(conversationId) {
   return dm.existingTracker(all[all.length - 1].id);
 }
 
-const iso = (ms) => (ms ? new Date(ms).toISOString() : null);
+/** ISO time of a ms number, numeric string or date string; null when unparseable. */
+const iso = (v) => {
+  if (v == null || v === '') return null;
+  const d = new Date(typeof v === 'string' && /^\d+$/.test(v) ? Number(v) : v);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+};
 
-const handlers = {
+/** Conversation + its call (if any): explicit id, else the live call, else the latest. */
+async function resolveCurrent(conversationId) {
+  const live = liveSessions();
+  let id = conversationId ? String(conversationId) : null;
+  if (!id) {
+    if (live.length > 1) {
+      throw new ToolError(`Several calls are live — pass conversation_id. Live: ${JSON.stringify(live.map((s) => s.convId))}.`);
+    }
+    id = live[0]?.convId ?? (await conversations.list())[0]?.id;
+  }
+  if (!id) throw new ToolError('There are no conversations yet.');
+  const conv = await conversations.get(id);
+  if (!conv) throw new ToolError(`No conversation with id "${id}".`);
+  const session = live.find((s) => s.convId === id) ?? null;
+  return { conv, session, live };
+}
+
+/** MCP servers of a conversation that is not in a call, from its stored toggles. */
+function storedServerReport(conv) {
+  const disabled = new Set(conv.mcpDisabled ?? []);
+  const skipped = new Set(conv.mcpSkipped ?? []);
+  return mergeServers(getLastConfiguredServers(), conversations.temporaryList(conv.mcpTemporary)).map((s) => ({
+    url: s.url, name: s.name ?? '', temporary: !!s.temporary, behavior: s.behavior,
+    enabled: !disabled.has(s.url), skipped: skipped.has(s.url),
+    ...(s.temporary ? { toolCount: s.toolCount ?? null } : {}),
+  }));
+}
+
+const clip = (text, n) => { const t = String(text ?? ''); return t.length > n ? `${t.slice(0, n)} …` : t; };
+
+export const handlers = { // exported for tests
+  async get_current_conversation(args) {
+    const { conv, session, live } = await resolveCurrent(args.conversation_id);
+    const turns = conv.turns ?? [];
+    return ok({
+      calling: !!session,
+      ...(live.length ? { live_conversations: live.map((s) => s.convId) } : {}),
+      conversation: {
+        id: conv.id, title: conv.title, created_at: iso(conv.createdAt), updated_at: iso(conv.updatedAt),
+        turns: turns.length,
+        last_turns: turns.slice(-3).map((t) => ({ role: t.role, text: clip(t.text, 200), at: iso(t.ts) })),
+      },
+      ...(session ? {
+        call: {
+          started_at: iso(session.callStartedAt),
+          gemini_state: session.session ? 'live' : 'reconnecting',
+          reconnect_tries: session.reconnectTries,
+          model: session.model ?? null,
+          voice: session.voiceName ?? null,
+          declared_tools: session.mcp?.functionDeclarations?.length ?? 0,
+          system_instruction_chars: session.lastDial?.systemInstruction.length ?? null,
+          paused: paused.has(conv.id),
+          speaker_muted: !!session.speakerMuted,
+          debug: dm.existingTracker(conv.id)?.debug ?? dm.defaults(),
+        },
+      } : {}),
+      mcp_servers: session ? session.mcpServerReport() : storedServerReport(conv),
+      mcp_servers_source: session ? 'live call' : 'stored toggles + last configured servers (not connected)',
+    });
+  },
+
+  async get_conversation_context(args) {
+    const { conv, session } = await resolveCurrent(args.conversation_id);
+    const maxTurns = Math.min(500, Math.max(1, Number(args.max_turns) || 40));
+    const withSys = args.include_system_instruction !== false;
+    const turns = conv.turns ?? [];
+    const dial = session?.lastDial ?? null;
+    let source, systemInstruction, toolsByServer = null;
+    if (dial) {
+      source = dial.resumed
+        ? 'resumed — Gemini restored its own server-side context from a resumption handle; the system instruction below is the base one'
+        : 'fresh — the stored history was replayed into the system instruction below';
+      systemInstruction = dial.systemInstruction;
+      const routes = new Map((session.mcp?.toolRoutes?.() ?? []).map((r) => [r.fn, r.serverUrl]));
+      toolsByServer = {};
+      for (const fn of dial.toolNames) (toolsByServer[routes.get(fn) ?? 'unknown'] ??= []).push(fn);
+    } else {
+      const handleFresh = conv.resumeHandle && Date.now() - (conv.resumeHandleAt ?? 0) < 24 * 60 * 60 * 1000;
+      source = `not in a call — the next call would ${handleFresh ? 'try to resume from the stored handle' : 'start fresh with this history'}`;
+      systemInstruction = `(base system instruction from Settings)${historyInstruction(turns)}`;
+    }
+    const accrual = session?.accrual?.text ? { role: session.accrual.role, text: session.accrual.text, in_progress: true } : null;
+    return ok({
+      conversation: { id: conv.id, title: conv.title },
+      calling: !!session,
+      source,
+      ...(dial ? { dialed_at: iso(dial.at), sliding_window_compression: dial.slidingWindow } : {}),
+      resume_handle_age_s: conv.resumeHandleAt ? Math.round((Date.now() - conv.resumeHandleAt) / 1000) : null,
+      system_instruction_chars: systemInstruction.length,
+      ...(withSys ? { system_instruction: systemInstruction } : {}),
+      history_caps: { max_turns: HISTORY_MAX_TURNS, max_chars: HISTORY_MAX_CHARS, max_line: HISTORY_MAX_LINE },
+      ...(toolsByServer ? { declared_tools_by_server: toolsByServer } : {}),
+      transcript: {
+        total_turns: turns.length,
+        turns: turns.slice(-maxTurns).map((t) => ({ role: t.role, text: t.text, at: iso(t.ts) })),
+        ...(accrual ? { current: accrual } : {}),
+      },
+    });
+  },
+
   async set_debug_logging(args) {
     if (typeof args.enabled !== 'boolean') throw new ToolError('enabled must be true or false.');
     const cfg = { enabled: args.enabled };
@@ -181,7 +320,9 @@ const handlers = {
 export const buildServer = createToolServer({
   name: 'callgemini-debug',
   instructions:
-    'Debug CallGemini\'s live voice pipeline. Start with diagnose (or get_live_metrics) on the live call; ' +
+    'Debug CallGemini\'s live voice pipeline. get_current_conversation says whether a call is live, which ' +
+    'conversation is current and its MCP servers; get_conversation_context shows what Gemini has as context. ' +
+    'For performance, start with diagnose (or get_live_metrics) on the live call; ' +
     'get_trace shows where the time went in each reply; get_events / get_logs give the timeline. For mic ' +
     'level, VAD, jitter cushion and RTT, first call set_debug_logging { enabled: true }. Tools default to the ' +
     'single live call, else the most recently traced one.',

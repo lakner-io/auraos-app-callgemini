@@ -36,7 +36,7 @@
       "kind": "mcp",
       "address": "/mcp/debug",
       "version": "1",
-      "description": "CallGemini debug MCP server: metrics, logs and per-turn traces of the live voice pipeline (mic, uplink, Gemini latency, downlink jitter, playback cushion, reconnects) — set_debug_logging, get_live_metrics, get_trace, get_events, get_logs, diagnose, list_traced_calls."
+      "description": "CallGemini debug MCP server: metrics, logs and per-turn traces of the live voice pipeline (mic, uplink, Gemini latency, downlink jitter, playback cushion, reconnects) — get_current_conversation, get_conversation_context, set_debug_logging, get_live_metrics, get_trace, get_events, get_logs, diagnose, list_traced_calls."
     }
   ],
   "tools": [
