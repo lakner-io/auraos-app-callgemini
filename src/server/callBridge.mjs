@@ -67,7 +67,7 @@ export function mergeServers(configured, temporary) {
   for (const s of configured ?? []) {
     if (!s?.url || seen.has(s.url)) continue;
     seen.add(s.url);
-    out.push({ url: s.url, transport: s.transport ?? 'http', name: '', temporary: false, behavior: serverBehavior(s) });
+    out.push({ url: s.url, transport: s.transport ?? 'http', name: typeof s.name === 'string' ? s.name.trim() : '', temporary: false, behavior: serverBehavior(s) });
   }
   for (const t of temporary ?? []) {
     if (!t?.url || seen.has(t.url)) continue;
@@ -309,7 +309,7 @@ export class CallSession {
     // loaded the record and PATCHed any later change, and for a brand-new chat
     // it is the only copy there is.
     this.configuredServers = Array.isArray(config.mcpServers) ? config.mcpServers.filter((s) => s?.url) : [];
-    shared.lastConfiguredServers = this.configuredServers.map((s) => ({ url: s.url, transport: s.transport ?? 'http', behavior: serverBehavior(s) }));
+    shared.lastConfiguredServers = this.configuredServers.map((s) => ({ url: s.url, name: typeof s.name === 'string' ? s.name.trim() : '', transport: s.transport ?? 'http', behavior: serverBehavior(s) }));
     this.temporaryServers = [];
     this.mcpDisabled = new Set(urlList(mcp?.disabled));
     this.mcpSkipped = new Set(urlList(mcp?.skipped));

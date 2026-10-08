@@ -71,3 +71,21 @@ test('during a call: live session, its servers, dialed context and tools by serv
   assert.deepEqual(c.declared_tools_by_server, { 'http://a/mcp': ['get_x'], 'http://b/mcp': ['run_y'] });
   assert.equal(c.transcript.current.text, 'switch to work');
 });
+
+test('configured MCP servers keep their custom name; empty name stays empty (UI falls back to the URL)', async () => {
+  const { mergeServers } = await import('../src/server/callBridge.mjs');
+  const merged = mergeServers(
+    [{ url: 'http://a/mcp', name: '  Shell  ' }, { url: 'http://b/mcp' }],
+    [{ url: 'http://a/mcp', name: 'dup temp' }, { url: 'http://t/mcp', name: 'Temp' }],
+  );
+  assert.deepEqual(merged.map((s) => [s.url, s.name, s.temporary]), [
+    ['http://a/mcp', 'Shell', false],   // Settings wins over a temporary duplicate, name trimmed
+    ['http://b/mcp', '', false],         // old config without a name still works
+    ['http://t/mcp', 'Temp', true],
+  ]);
+
+  globalThis.__callgeminiShared.lastConfiguredServers = [{ url: 'http://a/mcp', name: 'Shell' }];
+  await conversations.create({});
+  const r = (await handlers.get_current_conversation({})).structuredContent;
+  assert.equal(r.mcp_servers.find((s) => s.url === 'http://a/mcp').name, 'Shell');
+});

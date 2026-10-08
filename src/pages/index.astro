@@ -311,7 +311,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       outputDeviceId: '',         // '' = system default output
       languages: [],              // BCP-47 hints for input understanding; [] = auto-detect
       acpAddress: '',             // ACP endpoint for shadow transcript sync; '' = off
-      mcpServers: [],             // [{ url, transport, behavior? }] — behavior 'non-blocking' (default) | 'blocking'
+      mcpServers: [],             // [{ url, name?, transport, behavior? }] — behavior 'non-blocking' (default) | 'blocking'
     };
     // BCP-47 language hints — German & English first, then popular ones.
     const LANGUAGES = [
@@ -479,7 +479,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
         profiles: store.profiles.map((p) => [
           p.id, p.name, p.model, p.voiceName, (p.acpAddress ?? '').trim(), p.activeRoleId,
           (p.mcpServers ?? []).filter((m) => m?.url).map((m) => [
-            m.url.trim(), m.transport ?? 'http', m.behavior === 'blocking' ? 'blocking' : 'non-blocking',
+            m.url.trim(), (m.name ?? '').trim(), m.transport ?? 'http', m.behavior === 'blocking' ? 'blocking' : 'non-blocking',
           ]),
           p.roles.map((r) => [r.id, r.name, r.activeVersion, r.versions.map((v) => [v.n, (v.text ?? '').trim()])]),
         ]),
@@ -1687,6 +1687,15 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
         const row = document.createElement('div');
         row.className = 'mcp-row';
 
+        // Optional display name; empty = derived from the URL (mcpDisplayName).
+        const name = document.createElement('input');
+        name.className = 'field-input mcp-name';
+        name.type = 'text';
+        name.placeholder = 'Name (optional)';
+        name.maxLength = 60;
+        name.value = srv.name ?? '';
+        name.dataset.k = 'name';
+
         const url = document.createElement('input');
         url.className = 'field-input mcp-url';
         url.type = 'url';
@@ -1724,7 +1733,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
         del.dataset.action = 'mcp-del';
         del.textContent = 'Remove';
 
-        row.append(url, transport, behavior, del);
+        row.append(name, url, transport, behavior, del);
         els.mcpList.appendChild(row);
       });
     }
@@ -1733,6 +1742,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       const rows = [...els.mcpList.querySelectorAll('.mcp-row')];
       return rows.map((row) => ({
         url: row.querySelector('.mcp-url').value.trim(),
+        name: row.querySelector('.mcp-name')?.value.trim() ?? '',
         transport: row.querySelector('.mcp-transport').value,
         behavior: row.querySelector('.mcp-behavior')?.value === 'blocking' ? 'blocking' : 'non-blocking',
       })).filter((s) => s.url);
@@ -2262,7 +2272,7 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
       for (const s of config.mcpServers ?? []) {
         if (!s?.url || seen.has(s.url)) continue;
         seen.add(s.url);
-        out.push({ url: s.url, transport: s.transport ?? 'http', name: '', temporary: false, behavior: s.behavior === 'blocking' ? 'blocking' : 'non-blocking' });
+        out.push({ url: s.url, transport: s.transport ?? 'http', name: s.name ?? '', temporary: false, behavior: s.behavior === 'blocking' ? 'blocking' : 'non-blocking' });
       }
       for (const t of tempServers) {
         if (!t?.url || seen.has(t.url)) continue;
@@ -3359,8 +3369,9 @@ const hasEnvKey = !!process.env.GEMINI_API_KEY;
     .lang-chip[data-on="true"] { background: var(--aura-color-primary); color: var(--aura-color-bg); border-color: transparent; }
 
     .mcp-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 6px; }
-    .mcp-row { display: flex; gap: 6px; align-items: center; }
-    .mcp-url { flex: 1; }
+    .mcp-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .mcp-url { flex: 1 1 12rem; min-width: 0; }
+    .mcp-name { flex: 0 1 9rem; min-width: 5rem; }
     .mcp-transport, .mcp-behavior { flex: 0 0 auto; }
     .btn-del {
       font: inherit; font-size: 12px; font-weight: 600; cursor: pointer;
