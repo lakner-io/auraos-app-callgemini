@@ -314,8 +314,8 @@ export function diagnose(t) {
   if (errs.length) add('high', 'connection', `Gemini socket errors: ${errs.map(([k, v]) => `${k}×${v}`).join(', ')}; reconnects ${s.connection.reconnect_ms ? `p50 ${s.connection.reconnect_ms.p50} ms` : 'n/a'}.`, '1011 = Gemini internal error; each one is a silent gap while resuming.');
   if (s.connection.declared_tools > 60) add('medium', 'model', `${s.connection.declared_tools} tools declared.`, 'Large tool lists slow every turn; turn off unused MCP servers for this conversation.');
   if (s.connection.system_instruction_chars > 12_000) add('low', 'model', `System instruction is ${s.connection.system_instruction_chars} chars (incl. replayed history).`, 'Start a new conversation or trim history.');
-  const bigTools = t.tools.filter((x) => x.chars > 5000);
-  if (bigTools.length) add('low', 'tools', `${bigTools.length} tool result(s) over 5000 chars (largest ${Math.max(...bigTools.map((x) => x.chars))}).`, 'Large results stay in context and slow later turns.');
+  const bigTools = t.tools.filter((x) => x.chars > 2000);
+  if (bigTools.length) add('low', 'tools', `${bigTools.length} tool result(s) over 2000 chars (largest ${Math.max(...bigTools.map((x) => x.chars))}).`, 'Large results stay in context and slow later turns.');
   if (s.tools?.p95 > 3000) add('medium', 'tools', `Tool calls take ${s.tools.p95} ms (p95).`, 'The model waits for BLOCKING tools before speaking.');
   if (s.uplink.avg_rms != null && s.uplink.avg_rms < 60 && s.uplink.frames > 200) add('medium', 'mic', `Average mic RMS is very low (${s.uplink.avg_rms}).`, 'Wrong input device or too much gating/denoise — VAD may miss speech ends.');
   if (!out.length) add('info', 'all', 'No problems detected in the recorded data.', s.latency.turns ? '' : 'No complete turns yet — talk a few turns first.');

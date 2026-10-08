@@ -50,7 +50,7 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 
 /** Cap on the text of one tool result handed to Gemini. */
-const MAX_RESULT_CHARS = 6000;
+const MAX_RESULT_CHARS = 2000;
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 
@@ -372,6 +372,8 @@ export async function connectAll(servers = [], {
   /** Calls seen so far, by Gemini function-call id → their (pending) outcome.
    * Bounded; a placeholder only ever points at a recent call. */
   const calls = new Map();
+  /** Tool calls still waiting on a client — close() lets them finish. */
+  const inflight = new Set();
   const CALLS_MAX = 100;
   const PLACEHOLDER = /^function-call-\d+$/;
 
@@ -452,10 +454,13 @@ export async function connectAll(servers = [], {
         };
       }
       try {
-        const res = await route.client.callTool({
+        const pending = route.client.callTool({
           name: route.toolName,
           arguments: args,
         });
+        inflight.add(pending);
+        let res;
+        try { res = await pending; } finally { inflight.delete(pending); }
         let text = (res?.content ?? [])
           .map((c) => (c?.type === 'text' ? c.text : JSON.stringify(c)))
           .join('\n');
@@ -557,7 +562,20 @@ export async function connectAll(servers = [], {
       return deferreds.map((d) => d.promise);
     },
 
-    async close() {
+    /** Close every client — after in-flight tool calls settle (max
+     * `graceMs`). A tool-change re-dial closes the OLD bridge while the call
+     * that triggered it (add_mcp_server on our own /mcp/servers) is still
+     * waiting for its answer on it; closing at once turned that success into
+     * "MCP error -32000: Connection closed" for Gemini. */
+    async close({ graceMs = 15000 } = {}) {
+      if (inflight.size && graceMs > 0) {
+        let timer;
+        await Promise.race([
+          Promise.allSettled([...inflight]),
+          new Promise((r) => { timer = setTimeout(r, graceMs); timer.unref?.(); }),
+        ]);
+        clearTimeout(timer);
+      }
       await Promise.allSettled(clients.map((c) => c.close()));
     },
   };
