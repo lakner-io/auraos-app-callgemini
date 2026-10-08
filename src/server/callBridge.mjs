@@ -88,6 +88,22 @@ const RESPONSIVENESS_MS = { snappy: 350, balanced: 600, relaxed: 1000 };
  * straight back to the transcript replay. (Handles are server-side state with
  * a finite lifetime; a rejected one costs a round-trip.) */
 const RESUME_HANDLE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+/** goAway handling: dial this long before the announced end, re-check for a
+ * quiet moment this often, and show 'reconnecting' only if a switch takes
+ * longer than this. */
+const GOAWAY_MARGIN_MS = 5_000;
+const GOAWAY_RECHECK_MS = 500;
+const SWITCH_SLOW_MS = 800;
+
+/** "50s" / "1.5s" / { seconds, nanos } / ms number → milliseconds (null if unknown). */
+export function parseDurationMs(v) {
+  if (v == null) return null;
+  if (typeof v === 'number') return v;
+  if (typeof v === 'object') return (Number(v.seconds ?? 0) * 1000) + Math.round(Number(v.nanos ?? 0) / 1e6);
+  const m = /^\s*([\d.]+)\s*s\s*$/.exec(String(v));
+  return m ? Math.round(Number(m[1]) * 1000) : null;
+}
+
 /** Persist a fresh handle at most this often (they arrive every few seconds). */
 const HANDLE_PERSIST_INTERVAL_MS = 20_000;
 
@@ -149,6 +165,9 @@ export class CallSession {
     this.speakerMuted = false;                // browser's speaker-silence state (reported by the page)
     this.speakerWaiters = [];                 // set_speaker_muted calls awaiting the page's confirmation
     this.debugTimer = null;                   // periodic [callgemini/debug] console trace (debug MCP)
+    this.goAwayDeadline = 0;                  // Gemini announced the end of this connection: switch before this
+    this.goAwayTimer = null;                  // hard-deadline / retry timer for that switch
+    this.toolsInFlight = 0;                   // tool calls whose answer belongs to THIS Gemini session
     register(this);
 
     ws.on('message', (data, isBinary) => this.onClientMessage(data, isBinary));
@@ -580,6 +599,74 @@ export class CallSession {
     }
   }
 
+  /**
+   * Gemini announced (goAway) that this connection ends in `timeLeft`.
+   * Waiting for it to close truncated replies mid-sentence (call 66ff5d6c:
+   * a reply ended at "den korrekten" and the call went quiet). Instead,
+   * switch to a new connection ourselves — resumed with the latest handle,
+   * so context is kept — at the next quiet moment, or at the deadline.
+   */
+  onGoAway(timeLeft) {
+    const ms = parseDurationMs(timeLeft) ?? 30_000;
+    // Leave a margin for the dial itself; never wait past the server's limit.
+    this.goAwayDeadline = Date.now() + Math.max(0, ms - GOAWAY_MARGIN_MS);
+    this.maybeSwitchForGoAway();
+  }
+
+  /** Switch now if it's quiet (or the deadline is reached), else check again shortly. */
+  maybeSwitchForGoAway() {
+    if (!this.goAwayDeadline || this.closed || this.userStopped) return;
+    if (this.goAwayTimer) { clearTimeout(this.goAwayTimer); this.goAwayTimer = null; }
+    const quiet = this.injectionSafe() && this.toolsInFlight === 0;
+    if (quiet || Date.now() >= this.goAwayDeadline) {
+      this.goAwayDeadline = 0;
+      void this.switchConnection(quiet ? 'goAway' : 'goAway deadline');
+      return;
+    }
+    this.goAwayTimer = setTimeout(() => { this.goAwayTimer = null; this.maybeSwitchForGoAway(); },
+      Math.min(GOAWAY_RECHECK_MS, Math.max(0, this.goAwayDeadline - Date.now())));
+    this.goAwayTimer.unref?.();
+  }
+
+  cancelGoAwaySwitch() {
+    if (this.goAwayTimer) { clearTimeout(this.goAwayTimer); this.goAwayTimer = null; }
+    this.goAwayDeadline = 0;
+  }
+
+  /** Replace the Gemini connection, keeping context: resume with the latest
+   * handle, else fresh with the transcript replayed. The browser leg stays
+   * up; it only sees 'reconnecting' if the switch is slow. */
+  async switchConnection(why) {
+    if (this.closed || this.userStopped || this.retooling || !this.session) return;
+    this.retooling = true; // the old socket's close is ours — see onGeminiClose
+    const startedAt = Date.now();
+    const slow = setTimeout(() => this.emit({ type: 'status', state: 'reconnecting' }), SWITCH_SLOW_MS);
+    this.flushTurn();
+    const handle = this.resumeHandle;
+    try { this.session?.close?.(); } catch { /* noop */ }
+    this.session = null;
+    this.reconnectTries = 0;
+    try {
+      const resumed = handle ? await this.tryResume(handle, why) : false;
+      if (!resumed) {
+        this.resumeHandle = null;
+        const turns = this.convId ? (await conversations.get(this.convId))?.turns ?? [] : [];
+        await this.connectFresh(turns); // emits 'live'
+      }
+      if (this.closed || this.userStopped) { try { this.session?.close?.(); } catch { /* noop */ } this.session = null; return; }
+      const ms = Date.now() - startedAt;
+      this.dbg?.event('switch', { why, ms, resumed });
+      console.log(`[callgemini] switched Gemini connection (${why}) in ${ms} ms${resumed ? ', context resumed' : ', transcript replayed'}`);
+    } catch (err) {
+      console.error(`[callgemini] connection switch (${why}) failed:`, err?.message ?? err);
+      this.emit({ type: 'status', state: 'error', message: `Could not renew the Gemini connection: ${err?.message ?? err}` });
+      this.emit({ type: 'status', state: 'ended' });
+    } finally {
+      clearTimeout(slow);
+      this.retooling = false;
+    }
+  }
+
   /** Write the latest resumption handle to the conversation record, so a later
    * "continue" (or another app instance) can pick the context back up. */
   persistHandle(force = false) {
@@ -711,6 +798,7 @@ export class CallSession {
     this.dbg?.closed(event?.code, event?.reason ? String(event.reason) : '');
     // A tool-change re-dial closes the socket itself and reconnects right after.
     if (this.closed || this.userStopped || this.retooling) return;
+    this.cancelGoAwaySwitch(); // the server closed first — the resume below replaces it
     // A non-normal close carries the server's reason. 1007 can reject setup,
     // resumed state, or live input; it does not identify the offending field.
     // Log it and hand it to the browser, otherwise the call ends with no clue.
@@ -752,7 +840,8 @@ export class CallSession {
     }
     if (message?.goAway) {
       this.dbg?.event('goAway', { timeLeft: message.goAway.timeLeft ?? null });
-      console.log('[callgemini] Gemini goAway received (timeLeft:', message.goAway.timeLeft ?? '?', ') — will auto-resume');
+      console.log('[callgemini] Gemini goAway received (timeLeft:', message.goAway.timeLeft ?? '?', ') — switching connection at the next quiet moment');
+      this.onGoAway(message.goAway.timeLeft);
     }
 
     const sc = message?.serverContent;
@@ -782,6 +871,7 @@ export class CallSession {
     if (sc?.interrupted) this.dbg?.interrupted();
     if (sc?.turnComplete) this.dbg?.turnComplete();
     if (sc?.interrupted) { this.emit({ type: 'interrupted' }); this.userSpeakingUntil = Date.now() + 1500; } // barge-in = user speaking
+    if (sc?.turnComplete && this.goAwayDeadline) setImmediate(() => this.maybeSwitchForGoAway());
     if (sc?.turnComplete) { this.reconnectTries = 0; this.emit({ type: 'turnComplete' }); this.flushTurn(); this.maybeInjectToolResults(); }
 
     if (message?.toolCall?.functionCalls?.length) {
@@ -843,7 +933,9 @@ export class CallSession {
       this.noteToolCall(fc.name);
       const toolStartedAt = this.dbg?.toolStart(fc.name) ?? Date.now();
       console.log(`[callgemini/tool] ${fc.name} args:`, JSON.stringify(fc.args ?? {}).slice(0, 300));
+      this.toolsInFlight++;
       outcomes[i]
+        .finally(() => { this.toolsInFlight--; })
         .then((response) => {
           this.dbg?.toolEnd(fc.name, toolStartedAt, response);
           // Server-side trace of every tool round-trip: the outcome otherwise
@@ -951,6 +1043,7 @@ export class CallSession {
   /** End the Gemini side of the call but keep the WS open for a new call. */
   stopGemini(_reason) {
     this.userStopped = true; // intentional — onGeminiClose must not auto-resume
+    this.cancelGoAwaySwitch();
     if (this.injectTimer) { clearTimeout(this.injectTimer); this.injectTimer = null; }
     this.pendingToolResults = []; // late results have no session to go to
     this.flushTurn(); // persist any in-progress turn before tearing down
@@ -969,6 +1062,7 @@ export class CallSession {
     if (this.closed) return;
     this.closed = true;
     if (this.debugTimer) { clearInterval(this.debugTimer); this.debugTimer = null; }
+    this.cancelGoAwaySwitch();
     if (this.injectTimer) { clearTimeout(this.injectTimer); this.injectTimer = null; }
     this.pendingToolResults = [];
     this.flushTurn(); // don't lose the last utterance on a hard socket drop

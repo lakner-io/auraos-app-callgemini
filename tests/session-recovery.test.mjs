@@ -9,7 +9,7 @@ import { join } from 'node:path';
 // Isolate persistence before importing the real bridge/store: never touch /data.
 const testDataDir = await mkdtemp(join(tmpdir(), 'callgemini-recovery-test-'));
 process.env.AURA_DATA_DIR = testDataDir;
-const { CallSession } = await import('../src/server/callBridge.mjs');
+const { CallSession, parseDurationMs } = await import('../src/server/callBridge.mjs');
 const conversations = await import('../src/server/conversations.mjs');
 after(async () => {
   await globalThis.__callgeminiConversations.opChain;
@@ -42,6 +42,7 @@ test('a 1007 after completed turns and goAway recovers fresh once, not a dead ca
   await call.connectGemini('saved-handle');
   dials[0].callbacks.onmessage({ sessionResumptionUpdate: { resumable: true, newHandle: 'latest-handle' } });
   dials[0].callbacks.onmessage({ serverContent: { turnComplete: true } });
+  call.toolsInFlight = 1; // hold the proactive goAway switch: the server closes first here
   dials[0].callbacks.onmessage({ goAway: { timeLeft: '50s' } });
   dials[0].callbacks.onclose(rejected);
   await settle();
@@ -168,4 +169,68 @@ test('a tool call tells the page to play out its queue (toolPause) before the to
   const i = events.findIndex((e) => e.type === 'toolPause');
   assert.ok(i >= 0, 'no toolPause event');
   assert.ok(i < events.findIndex((e) => e.type === 'tool'), 'toolPause must come before the tool chip');
+});
+
+test('parseDurationMs reads the goAway timeLeft formats', () => {
+  assert.equal(parseDurationMs('50s'), 50_000);
+  assert.equal(parseDurationMs('1.5s'), 1500);
+  assert.equal(parseDurationMs({ seconds: '2', nanos: 500_000_000 }), 2500);
+  assert.equal(parseDurationMs('soon'), null);
+});
+
+test('goAway while quiet switches to a resumed connection right away', async (t) => {
+  const { call, dials, events } = harness(t);
+  await call.connectGemini();
+  dials[0].callbacks.onmessage({ sessionResumptionUpdate: { resumable: true, newHandle: 'h1' } });
+  dials[0].callbacks.onmessage({ goAway: { timeLeft: '50s' } });
+  await settle();
+  assert.equal(dials.length, 2);
+  assert.deepEqual(dials[1].config.sessionResumption, { handle: 'h1' });
+  dials[0].callbacks.onclose({ code: 1000 }); // the old socket closing must not trigger another resume
+  await settle();
+  assert.equal(dials.length, 2);
+  assert.equal(events.at(-1).state, 'live');
+});
+
+test('goAway during a reply waits for turnComplete, then switches', async (t) => {
+  const { call, dials } = harness(t);
+  await call.connectGemini();
+  dials[0].callbacks.onmessage({ sessionResumptionUpdate: { resumable: true, newHandle: 'h1' } });
+  dials[0].callbacks.onmessage({ serverContent: { outputTranscription: { text: 'Es geht darum, den ' } } });
+  dials[0].callbacks.onmessage({ goAway: { timeLeft: '50s' } });
+  await settle();
+  assert.equal(dials.length, 1, 'must not cut the reply');
+  dials[0].callbacks.onmessage({ serverContent: { outputTranscription: { text: 'korrekten Status zu prüfen.' } } });
+  dials[0].callbacks.onmessage({ serverContent: { turnComplete: true } });
+  await settle();
+  assert.equal(dials.length, 2);
+});
+
+test('goAway waits for a tool in flight, and the deadline forces the switch', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+  const { call, dials } = harness(t);
+  await call.connectGemini();
+  dials[0].callbacks.onmessage({ sessionResumptionUpdate: { resumable: true, newHandle: 'h1' } });
+  call.toolsInFlight = 1;                         // a BLOCKING tool's answer belongs to this session
+  dials[0].callbacks.onmessage({ goAway: { timeLeft: '10s' } });
+  await settle();
+  assert.equal(dials.length, 1);
+  t.mock.timers.tick(4000);                       // still inside the 10 s − 5 s margin window
+  await settle();
+  assert.equal(dials.length, 1);
+  t.mock.timers.tick(1500);                       // past the deadline
+  await settle();
+  assert.equal(dials.length, 2, 'deadline must force the switch');
+});
+
+test('stopping the call cancels a pending goAway switch', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 2_000_000 });
+  const { call, dials } = harness(t);
+  await call.connectGemini();
+  call.toolsInFlight = 1;
+  dials[0].callbacks.onmessage({ goAway: { timeLeft: '10s' } });
+  call.stopGemini('user-stop');
+  t.mock.timers.tick(20_000);
+  await settle();
+  assert.equal(dials.length, 1);
 });
