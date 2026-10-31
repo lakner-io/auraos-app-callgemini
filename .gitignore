@@ -15,3 +15,22 @@ data/
 # Logs / misc
 *.log
 .DS_Store
+
+# AuraOS: runtime data and secrets never go into the repo
+/io.lakner.callgemini/
+.sidecars/
+node_modules/
+.pnpm-store/
+.data/
+dist/
+.astro/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.db
+*.sqlite
+*.sqlite*
+credentials.json
+*-credentials.json
