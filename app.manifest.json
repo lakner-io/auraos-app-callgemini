@@ -1,5 +1,6 @@
 {
   "id": "io.lakner.callgemini",
+  "originId": "c94a5bdc-380f-4871-9371-0fc288299dbd",
   "name": "CallGemini",
   "version": "0.1.0",
   "description": "Voice-first chat with Gemini Live — talk, see the dialog transcribed live, and wire in your own MCP tools. Serves an MCP server to add/remove per-conversation MCP servers at runtime, plus a control MCP server for live calls (e.g. silence the speaker).",
